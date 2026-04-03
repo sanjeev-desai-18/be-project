@@ -1,0 +1,18 @@
+{
+  "iou_threshold": 0.45,
+  "detection_threshold": 0.3,
+  "output_activation": "none",
+  "label_offset": 0,
+  "max_boxes": 100,
+  "classes": 7,
+  "labels": [
+    "background",
+    "100_rupees",
+    "10_rupees",
+    "2000_rupees",
+    "200_rupees",
+    "20_rupees",
+    "500_rupees",
+    "50_rupees"
+  ]
+}

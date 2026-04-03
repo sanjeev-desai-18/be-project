@@ -1,0 +1,43 @@
+# ── requirements_pi.txt ──────────────────────────────────────────────────────
+# Raspberry Pi 5 + Hailo 8 AI HAT + Raspberry Pi Camera 3 Wide
+#
+# Install order:
+#   1. Install HailoRT system packages (outside pip):
+#        sudo apt update
+#        sudo apt install hailo-all          # installs hailo driver + hailort + hailo-platform
+#   2. Install picamera2 (system package, not pip):
+#        sudo apt install python3-picamera2
+#   3. Then install the rest with pip:
+#        pip install -r requirements_pi.txt
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── STT ───────────────────────────────────────────────────────────────────────
+sounddevice==0.4.6
+soundfile==0.12.1
+numpy==1.26.4
+groq>=0.9.0
+
+# ── Agent (LangGraph + LangChain + Groq) ─────────────────────────────────────
+langchain==0.2.16
+langgraph==0.2.28
+langchain-groq==0.1.9
+
+# ── Vision ────────────────────────────────────────────────────────────────────
+opencv-python==4.10.0.84
+Pillow==10.4.0
+
+# ── TTS ───────────────────────────────────────────────────────────────────────
+gTTS==2.5.3
+# playsound has issues on Pi with ALSA; use pygame.mixer instead:
+pygame==2.6.0
+elevenlabs>=1.9.0          # optional, only if TTS_ENGINE = "elevenlabs"
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv==1.0.1
+loguru==0.7.2
+
+# ── NOT needed on Pi (Hailo replaces ONNX Runtime, no FastAPI/uvicorn) ────────
+# onnxruntime        ← replaced by hailo-platform (apt)
+# fastapi            ← removed (terminal only)
+# uvicorn            ← removed (terminal only)
+# torch              ← not needed

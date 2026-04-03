@@ -1,0 +1,15 @@
+{
+  "network_type": "yolov8",
+  "labels": [
+    "10_rupees",
+    "100_rupees",
+    "20_rupees",
+    "200_rupees",
+    "2000_rupees",
+    "50_ruppes",
+    "500_rupees"
+  ],
+  "score_threshold": 0.3,
+  "nms_iou_threshold": 0.45,
+  "max_boxes": 100
+}

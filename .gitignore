@@ -1,0 +1,28 @@
+# env files
+.env
+.env.*
+
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# virtual env
+venv/
+.env/
+.venv/
+
+# logs
+logs/
+*.log
+
+# vscode
+.vscode/
+
+# system
+.DS_Store
+Thumbs.db
+
+segment.py
+venv

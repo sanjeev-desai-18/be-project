@@ -1,0 +1,44 @@
+# -- requirements_pi.txt ------------------------------------------------------
+# Raspberry Pi 5 + Hailo 8 AI HAT + Raspberry Pi Camera 3 Wide
+# Python 3.13 (must match hailo_platform .so compiled version)
+#
+# Install order:
+#   1. sudo apt install hailo-all python3-picamera2 python3-pygame python3.13-venv ffmpeg -y
+#   2. python3.13 -m venv venv --system-site-packages
+#   3. source venv/bin/activate
+#   4. Add system packages to venv path:
+#        echo "/usr/lib/python3/dist-packages" > venv/lib/python3.13/site-packages/system.pth
+#   5. pip install -r requirements_pi.txt
+# -----------------------------------------------------------------------------
+
+# -- STT -----------------------------------------------------------------------
+sounddevice>=0.4.6
+soundfile>=0.12.1
+numpy>=1.24.0
+groq>=0.9.0
+
+# -- Agent (LangGraph + LangChain + Groq) -------------------------------------
+langchain>=0.2.0
+langgraph>=0.2.0
+langchain-groq>=0.1.9
+
+# -- Vision --------------------------------------------------------------------
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# -- TTS -----------------------------------------------------------------------
+gTTS>=2.5.0
+# pygame installed via apt: sudo apt install python3-pygame
+elevenlabs>=1.9.0
+
+# -- Utilities -----------------------------------------------------------------
+python-dotenv>=1.0.0
+loguru>=0.7.0
+
+# -- NOT needed on Pi ----------------------------------------------------------
+# onnxruntime   ? replaced by hailo-platform (apt)
+# fastapi       ? removed (terminal only)
+# uvicorn       ? removed (terminal only)
+# torch         ? not needed
+# playsound     ? replaced by pygame (apt)
+# pygame        ? installed via apt, not pip (pip version fails on Python 3.13)
