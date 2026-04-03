@@ -1,0 +1,17 @@
+Looking in indexes: https://pypi.org/simple, https://www.piwheels.org/simple
+Collecting langdetect
+  Downloading https://www.piwheels.org/simple/langdetect/langdetect-1.0.9-py3-none-any.whl (994 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 994.5/994.5 kB 1.4 MB/s eta 0:00:00
+Collecting duckduckgo-search
+  Downloading https://www.piwheels.org/simple/duckduckgo-search/duckduckgo_search-8.1.1-py3-none-any.whl (18 kB)
+Collecting six (from langdetect)
+  Downloading https://www.piwheels.org/simple/six/six-1.17.0-py2.py3-none-any.whl (11 kB)
+Requirement already satisfied: click>=8.1.8 in /usr/lib/python3/dist-packages (from duckduckgo-search) (8.1.8)
+Collecting primp>=0.15.0 (from duckduckgo-search)
+  Downloading primp-1.2.2-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl.metadata (3.6 kB)
+Requirement already satisfied: lxml>=5.3.0 in /usr/lib/python3/dist-packages (from duckduckgo-search) (5.4.0)
+Downloading primp-1.2.2-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl (4.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 4.3/4.3 MB 4.2 MB/s eta 0:00:00
+Installing collected packages: six, primp, langdetect, duckduckgo-search
+
+Successfully installed duckduckgo-search-8.1.1 langdetect-1.0.9 primp-1.2.2 six-1.17.0
