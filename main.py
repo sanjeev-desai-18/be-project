@@ -102,7 +102,7 @@ def mic_loop():
         return
 
     logger.info("Microphone loop started — listening for commands")
-    speaker.speak("Blind assistant ready. Say currency check to detect notes.")
+    speaker.speak("Hii there your personal navigator is ready, How can I help you?")
 
     while True:
         try:
