@@ -1,47 +1,59 @@
 """
 modules/currency/currency_module.py
-─────────────────────────────────────
-Thread manager for currency detection.
-Exposes start_currency_mode() and stop_currency_mode() to the LangGraph agent.
-
-The actual inference (Hailo 8) lives in currency_detector.py.
 """
-
 import threading
+import time
 from utils.logger import logger
-from .currency_detector import start_currency_detection, stop_currency_detection
 
 currency_active = False
-currency_thread = None
 _lock           = threading.Lock()
 
 
-def start_currency_mode():
-    global currency_active, currency_thread
-
+def reset_currency_state():
+    global currency_active
     with _lock:
-        if currency_active and currency_thread and currency_thread.is_alive():
-            logger.warning("Currency mode already active — ignoring duplicate start")
-            return
+        currency_active = False
 
+
+def start_currency_mode():
+    global currency_active
+    with _lock:
+        import modules.currency.currency_detector as _det
+        if _det._thread is not None and _det._thread.is_alive():
+            logger.warning("Currency already active")
+            currency_active = True
+            return
         currency_active = True
-        currency_thread = threading.Thread(
-            target=start_currency_detection,
-            daemon=True
-        )
-        currency_thread.start()
+        _det.start_currency_detection()
         logger.info("Currency mode started ✓")
 
 
 def stop_currency_mode():
-    global currency_active, currency_thread
+    global currency_active
+    from utils.camera_manager import camera_manager
+    import modules.currency.currency_detector as _det
 
     with _lock:
         if not currency_active:
-            logger.warning("Currency mode not active — nothing to stop")
+            logger.info("Currency not active")
             return
-
-        stop_currency_detection()
+        _det.stop_currency_detection()
         currency_active = False
-        currency_thread = None
-        logger.info("Currency mode stopped ✓")
+
+    # Wait outside lock for clean thread exit
+    released = _det.wait_for_camera_release(timeout=2.0)
+
+    if not released:
+        # Thread is stuck in capture_array(). Fix:
+        # 1. Stop the camera from outside — this raises an exception
+        #    inside capture_array(), letting the thread exit its loop
+        # 2. Force-release the camera lock so next acquire() can proceed
+        logger.warning("Thread stuck in capture_array() — calling force_release()")
+        camera_manager.force_release()
+
+        # Give thread a moment to process the exception and exit
+        time.sleep(0.5)
+
+    # Always reset module state so next start() is a clean launch
+    _det.reset()
+    logger.info("Currency stopped and reset ✓")

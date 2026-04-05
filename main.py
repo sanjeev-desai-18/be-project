@@ -102,7 +102,7 @@ def mic_loop():
         return
 
     logger.info("Microphone loop started — listening for commands")
-    speaker.speak("Hii there your personal navigator is ready, How can I help you?")
+    speaker.speak("Blind assistant ready. Say currency check to detect notes.")
 
     while True:
         try:
@@ -132,10 +132,34 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt — shutting down")
         speaker.speak("Goodbye!")
-        # Ensure any open CV2 windows are closed
+
+        # Stop currency detection if running
+        try:
+            from modules.currency.currency_module import stop_currency_mode, currency_active
+            if currency_active:
+                stop_currency_mode()
+        except Exception:
+            pass
+
+        # Shutdown Hailo device (only called once, here at exit)
+        try:
+            from modules.currency.currency_detector import shutdown as hailo_shutdown
+            hailo_shutdown()
+        except Exception:
+            pass
+
+        # Shutdown shared camera manager
+        try:
+            from utils.camera_manager import camera_manager
+            camera_manager.shutdown()
+        except Exception:
+            pass
+
+        # Close any open CV2 windows
         try:
             import cv2
             cv2.destroyAllWindows()
         except Exception:
             pass
+
         os._exit(0)

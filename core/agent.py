@@ -70,6 +70,55 @@ def _parse_llm_json(raw: str) -> dict:
     return {k.strip(): v for k, v in result.items()}
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CAMERA OWNERSHIP HELPER
+#
+# The camera is a single shared resource (camera_manager singleton).
+# Currency detection holds the camera lock continuously while running.
+# Scene and reading need the camera for a brief one-shot capture.
+#
+# Rule: before any module calls camera_manager.acquire(), currency MUST be
+# stopped and the camera lock must be free.
+#
+# _stop_currency_if_running() is called at the start of scene_node and
+# reading_node. It is a no-op if currency is not active.
+# ══════════════════════════════════════════════════════════════════════════════
+def _stop_currency_if_running() -> bool:
+    """
+    Stop currency detection if it is currently active and wait for the camera
+    to be fully released before returning.
+
+    Returns True if currency was stopped (camera is now free).
+    Returns False if currency was not running (camera was already free).
+    """
+    try:
+        import modules.currency.currency_module as _cm
+        import modules.currency.currency_detector as _det
+
+        if not _cm.currency_active:
+            # Currency not running — camera is free, nothing to do
+            return False
+
+        logger.info("Camera requested by another module — stopping currency first...")
+
+        # Signal currency thread to stop and release the camera.
+        # stop_currency_mode() releases _lock before waiting, so no deadlock.
+        _cm.stop_currency_mode()
+
+        # wait_for_camera_release() already called inside stop_currency_mode(),
+        # but call again with a short timeout as a safety double-check.
+        released = _det._camera_released.wait(timeout=2.0)
+        if not released:
+            logger.error("Camera still not released after stop — proceeding anyway")
+
+        logger.info("Currency stopped, camera free ✓")
+        return True
+
+    except Exception as e:
+        logger.error(f"_stop_currency_if_running failed: {e}", exc_info=True)
+        return False
+
+
 # ═══════════════════════════════════════════════
 # NODE 1 — Interpret Intent
 # ═══════════════════════════════════════════════
@@ -161,10 +210,16 @@ def route_to_module(state: AssistantState) -> str:
 
 # ═══════════════════════════════════════════════
 # NODE 3a — Scene
+# Stops currency first if running, then captures scene.
+# After scene is done, camera is released — currency does NOT auto-restart.
+# User must say "paisa check" again to restart currency mode.
 # ═══════════════════════════════════════════════
 def scene_node(state: AssistantState) -> AssistantState:
     from modules.scene.scene_module import SceneModule
     logger.info("Executing Scene module")
+
+    # Stop currency and free the camera before we try to acquire it
+    _stop_currency_if_running()
 
     try:
         result = SceneModule().run()
@@ -177,10 +232,15 @@ def scene_node(state: AssistantState) -> AssistantState:
 
 # ═══════════════════════════════════════════════
 # NODE 3b — Reading
+# Stops currency first if running, then captures frame for OCR.
+# After reading is done, camera is released — currency does NOT auto-restart.
 # ═══════════════════════════════════════════════
 def reading_node(state: AssistantState) -> AssistantState:
     from modules.reading.reading_module import ReadingModule
     logger.info("Executing Reading module")
+
+    # Stop currency and free the camera before we try to acquire it
+    _stop_currency_if_running()
 
     try:
         result = ReadingModule().run()
@@ -193,6 +253,8 @@ def reading_node(state: AssistantState) -> AssistantState:
 
 # ═══════════════════════════════════════════════
 # NODE 3c — Currency
+# Starts currency detection from scratch.
+# If already running (shouldn't happen, but guard anyway), skip.
 # ═══════════════════════════════════════════════
 def currency_node(state: AssistantState) -> AssistantState:
     from modules.currency.currency_module import start_currency_mode, currency_active
@@ -200,6 +262,7 @@ def currency_node(state: AssistantState) -> AssistantState:
 
     try:
         if currency_active:
+            logger.info("Currency already active — skipping duplicate start")
             return {**state, "final_output": ""}
 
         start_currency_mode()
@@ -214,6 +277,7 @@ def currency_node(state: AssistantState) -> AssistantState:
 
 # ═══════════════════════════════════════════════
 # NODE 3d — Stop
+# Explicit user "stop" command.
 # ═══════════════════════════════════════════════
 def stop_node(state: AssistantState) -> AssistantState:
     from modules.currency.currency_module import stop_currency_mode, currency_active
@@ -221,6 +285,7 @@ def stop_node(state: AssistantState) -> AssistantState:
 
     try:
         if not currency_active:
+            logger.info("Nothing active to stop")
             return {**state, "final_output": ""}
 
         stop_currency_mode()
@@ -235,6 +300,7 @@ def stop_node(state: AssistantState) -> AssistantState:
 
 # ═══════════════════════════════════════════════
 # NODE 3e — Knowledge
+# No camera involved — runs freely regardless of currency state.
 # ═══════════════════════════════════════════════
 def knowledge_node(state: AssistantState) -> AssistantState:
     from modules.knowledge.knowledge_logic import handle_knowledge_query
@@ -267,12 +333,13 @@ def greeting_node(state: AssistantState) -> AssistantState:
 def tts_node(state: AssistantState) -> AssistantState:
     from tts.speaker import Speaker
 
-    # ⭐ If module already spoke, skip TTS
+    # If module already spoke (e.g. knowledge_node handles its own TTS), skip
     if state.get("spoken"):
         return state
 
     output = state.get("final_output", "").strip()
-    Speaker().speak(output)
+    if output:
+        Speaker().speak(output)
     return state
 
 
@@ -299,22 +366,22 @@ def build_agent():
         "confidence_router",
         route_to_module,
         {
-            "scene_node":    "scene_node",
-            "reading_node":  "reading_node",
-            "currency_node": "currency_node",
-            "stop_node":     "stop_node",
-            "knowledge_node":"knowledge_node",
-            "greeting_node": "greeting_node",
-            "tts_node":      "tts_node",
+            "scene_node":     "scene_node",
+            "reading_node":   "reading_node",
+            "currency_node":  "currency_node",
+            "stop_node":      "stop_node",
+            "knowledge_node": "knowledge_node",
+            "greeting_node":  "greeting_node",
+            "tts_node":       "tts_node",
         }
     )
 
-    graph.add_edge("scene_node",    "tts_node")
-    graph.add_edge("reading_node",  "tts_node")
-    graph.add_edge("currency_node", "tts_node")
-    graph.add_edge("stop_node",     "tts_node")
-    graph.add_edge("knowledge_node","tts_node")
-    graph.add_edge("greeting_node", "tts_node")
+    graph.add_edge("scene_node",     "tts_node")
+    graph.add_edge("reading_node",   "tts_node")
+    graph.add_edge("currency_node",  "tts_node")
+    graph.add_edge("stop_node",      "tts_node")
+    graph.add_edge("knowledge_node", "tts_node")
+    graph.add_edge("greeting_node",  "tts_node")
     graph.add_edge("tts_node", END)
 
     return graph.compile()
