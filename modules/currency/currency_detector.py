@@ -1,31 +1,11 @@
 """
 modules/currency/currency_detector.py
-
-KEY FIX — cv2 display must run on the main thread:
-────────────────────────────────────────────────────
-On Linux (Qt/GTK backend), ALL cv2 GUI calls — namedWindow, imshow,
-waitKey, destroyAllWindows — must be called from the SAME thread that
-first called them, and that thread must be the process main thread.
-
-When called from a background daemon thread (_run), the first session
-works by luck. On the second launch the Qt event loop is in a broken
-state from the previous session's window that was destroyed from the
-wrong thread. cv2.namedWindow() then blocks waiting for the Qt loop
-to respond — forever, hanging the second session.
-
-Fix: the detection thread never calls any cv2 GUI function. It puts
-rendered BGR frames into _display_queue (maxsize=1, drop-oldest).
-main.py calls pump_display() on every pipeline iteration from the
-main thread. pump_display() drains the queue and calls imshow/waitKey.
-The window is created once and reused across sessions — no destroy/
-recreate cycle that could leave Qt in a broken state.
 """
 
 import cv2
 import json
 import numpy as np
 import os
-import queue
 import threading
 import time
 
@@ -44,6 +24,23 @@ CLASS_NAMES_FALLBACK = [
 
 CONFIDENCE_THRESHOLD = 0.30
 WINDOW_NAME          = "Currency Detection - Hailo 8"
+
+
+# ── Shared display frame ──────────────────────────────────────────────────────
+# _run() writes here. Main thread reads and calls imshow.
+# Lock protects the swap. Using a list so it's mutable from inner scope.
+_frame_lock    = threading.Lock()
+_latest_frame  = [None]   # None = no frame yet / detection stopped
+
+
+def get_latest_frame():
+    with _frame_lock:
+        return _latest_frame[0]
+
+
+def _set_latest_frame(frame):
+    with _frame_lock:
+        _latest_frame[0] = frame
 
 
 # ── Hailo singleton ───────────────────────────────────────────────────────────
@@ -66,7 +63,7 @@ class _HailoManager:
             hailo = Hailo(HEF_PATH)
             h, w, _ = hailo.get_input_shape()
             self._hailo, self._model_h, self._model_w = hailo, h, w
-            logger.info(f"HailoManager: ready {w}x{h} ✓")
+            logger.info(f"HailoManager: ready {w}x{h}")
             return self._hailo, self._model_h, self._model_w
 
     def shutdown(self):
@@ -101,77 +98,6 @@ def _load_labels():
     return CLASS_NAMES_FALLBACK
 
 CLASS_NAMES = _load_labels()
-
-
-# ── Display queue (detection thread -> main thread) ───────────────────────────
-# maxsize=1: if main thread is slow, drop oldest frame and keep latest.
-# Sentinel value None signals the main thread to blank the window.
-_display_queue  = queue.Queue(maxsize=1)
-_window_created = False
-
-
-def pump_display():
-    """
-    CALL THIS FROM THE MAIN THREAD on every pipeline loop iteration.
-    Drains the display queue and renders any pending frame via cv2.
-    Returns True if 'q' was pressed (relay stop signal to caller).
-    """
-    global _window_created
-    q_pressed = False
-    try:
-        item = _display_queue.get_nowait()
-    except queue.Empty:
-        # Nothing queued — pump Qt event loop so window stays responsive
-        if _window_created:
-            if (cv2.waitKey(1) & 0xFF) == ord('q'):
-                q_pressed = True
-        return q_pressed
-
-    if item is None:
-        # Sentinel: detection stopped — destroy window cleanly from main thread.
-        # Double waitKey(1) gives Qt two event loop ticks to fully process the
-        # destroy before namedWindow() can be called again next session.
-        if _window_created:
-            try:
-                cv2.destroyAllWindows()
-                cv2.waitKey(1)
-                cv2.waitKey(1)
-                logger.info("pump_display: cv2 window destroyed ✓")
-            except Exception as e:
-                logger.warning(f"pump_display: window destroy error: {e}")
-            _window_created = False
-        return q_pressed
-
-    # Normal annotated frame
-    if not _window_created:
-        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WINDOW_NAME, 960, 540)
-        _window_created = True
-        logger.info("pump_display: cv2 window created on main thread ✓")
-
-    try:
-        cv2.imshow(WINDOW_NAME, item)
-        if (cv2.waitKey(1) & 0xFF) == ord('q'):
-            q_pressed = True
-    except Exception as e:
-        logger.warning(f"pump_display: imshow error: {e}")
-
-    return q_pressed
-
-
-def _enqueue_frame(frame_bgr_or_none):
-    """Push frame (or None sentinel) to display queue, drop oldest if full."""
-    try:
-        _display_queue.put_nowait(frame_bgr_or_none)
-    except queue.Full:
-        try:
-            _display_queue.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            _display_queue.put_nowait(frame_bgr_or_none)
-        except queue.Full:
-            pass
 
 
 # ── Interruptible capture ─────────────────────────────────────────────────────
@@ -243,15 +169,14 @@ def reset():
     _camera_released = threading.Event()
     _camera_released.set()
     _thread          = None
-    logger.info("currency_detector: state reset ✓")
+    logger.info("currency_detector: state reset")
 
 
-# ── Detection loop (background thread — ZERO cv2 GUI calls) ──────────────────
+# ── Detection loop — writes frames, never calls imshow ───────────────────────
 def _run(stop_evt, camera_released_evt):
     logger.info("_run(): started")
     camera_released_evt.clear()
 
-    # Step 1: Hailo
     logger.info("_run(): getting Hailo...")
     try:
         hailo, model_h, model_w = hailo_manager.get()
@@ -261,13 +186,10 @@ def _run(stop_evt, camera_released_evt):
         camera_released_evt.set()
         return
 
-    # Step 2: Check stop before camera acquire
     if stop_evt.is_set():
-        logger.warning("_run(): stop_evt already set before camera acquire — aborting")
         camera_released_evt.set()
         return
 
-    # Step 3: Camera
     logger.info("_run(): acquiring camera...")
     camera_acquired = False
     try:
@@ -283,23 +205,18 @@ def _run(stop_evt, camera_released_evt):
         camera_released_evt.set()
         return
 
-    # Step 4: Check stop again after slow acquire
     if stop_evt.is_set():
-        logger.warning("_run(): stop_evt set during camera acquire — releasing and aborting")
-        try:
-            camera_manager.release()
-        except Exception:
-            pass
+        try: camera_manager.release()
+        except Exception: pass
         camera_released_evt.set()
         return
 
-    # Step 5: CLAHE setup only — no cv2 GUI calls in this thread ever
     try:
         _noir = getattr(__import__("config"), "NOIR_CORRECTION", True)
     except Exception:
         _noir = True
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)) if _noir else None
-    logger.info(f"_run(): NOIR_CORRECTION={_noir}, entering detection loop ✓")
+    logger.info(f"_run(): NOIR_CORRECTION={_noir}, entering detection loop")
 
     fps_t=time.time(); fps_count=0; fps=0.0
 
@@ -307,7 +224,6 @@ def _run(stop_evt, camera_released_evt):
         while not stop_evt.is_set():
             frame, status = _capture_with_timeout(picam2, stop_evt, timeout=1.0)
             if status == "stop":
-                logger.info("_run(): stop via capture timeout")
                 break
             if status in ("timeout", "error"):
                 continue
@@ -333,9 +249,9 @@ def _run(stop_evt, camera_released_evt):
             if time.time()-fps_t>=2.0:
                 fps=fps_count/(time.time()-fps_t); fps_count=0; fps_t=time.time()
 
-            # Render and push to queue — main thread calls pump_display()
+            # Write annotated frame for main thread to display
             bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            _enqueue_frame(_draw_boxes(bgr, detections, fps))
+            _set_latest_frame(_draw_boxes(bgr, detections, fps))
 
     except Exception as e:
         logger.error(f"_run(): loop exception: {e}", exc_info=True)
@@ -347,9 +263,9 @@ def _run(stop_evt, camera_released_evt):
                 logger.info("_run(): camera released")
             except Exception as e:
                 logger.warning(f"_run(): camera release error: {e}")
-        _enqueue_frame(None)   # sentinel → main thread blanks window
+        _set_latest_frame(None)   # signal main thread: detection stopped
         camera_released_evt.set()
-        logger.info("_run(): fully exited ✓")
+        logger.info("_run(): fully exited")
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -367,7 +283,7 @@ def start_currency_detection():
         daemon=True
     )
     _thread.start()
-    logger.info("Currency detection thread launched ✓")
+    logger.info("Currency detection thread launched")
 
 
 def stop_currency_detection():
@@ -377,7 +293,7 @@ def stop_currency_detection():
         _camera_released.set()
         return
     _stop_evt.set()
-    logger.info("Currency stop signal sent ✓")
+    logger.info("Currency stop signal sent")
 
 
 def wait_for_camera_release(timeout=5.0):

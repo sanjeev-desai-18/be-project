@@ -1,19 +1,5 @@
 """
 main.py — Blind Assistant entry point for Raspberry Pi 5 + Hailo 8 AI HAT
-- Pure terminal / mic loop (no web server, no browser, no FastAPI)
-- Listens on USB mic via Groq Whisper STT
-- Routes intent via LangGraph agent
-- Currency detection runs on Hailo 8 using .hef model
-- TTS output to Bluetooth earbuds via gTTS / ElevenLabs
-- CV2 window shows live bounding boxes during currency mode
-- Mic loop keeps running so user can switch modes at any time
-
-DISPLAY ARCHITECTURE:
-  cv2 GUI calls (namedWindow, imshow, waitKey) MUST run on the main thread
-  on Linux Qt/GTK backends. mic_loop() blocks for seconds inside listen(),
-  which starves the Qt event loop and causes the window to freeze/hang on
-  second launch. Fix: mic_loop() runs in a daemon thread. The main thread
-  does nothing except call pump_display() in a tight loop, keeping Qt alive.
 """
 
 import sys
@@ -37,9 +23,10 @@ from tts.speaker import Speaker
 from modules.stt.listener import listen
 from core.agent import agent
 from core.state import AssistantState
-from modules.currency.currency_detector import pump_display
 
 speaker = Speaker()
+
+WINDOW_NAME = "Currency Detection - Hailo 8"
 
 
 # ══════════════════════════════════════════════
@@ -90,7 +77,7 @@ def run_pipeline(transcript: str) -> None:
         logger.info("─── Request complete ───")
 
     except KeyError as e:
-        logger.warning(f"Pipeline state key error — missing key: {e}")
+        logger.warning(f"Pipeline state key error: {e}")
         speaker.speak("Sorry, I had trouble understanding that.")
     except ValueError as e:
         logger.warning(f"Pipeline value error: {e}")
@@ -101,8 +88,7 @@ def run_pipeline(transcript: str) -> None:
 
 
 # ══════════════════════════════════════════════
-# MIC LOOP — runs in a background thread
-# Main thread must stay free for cv2 GUI calls
+# MIC LOOP — runs in background thread
 # ══════════════════════════════════════════════
 def mic_loop():
     if not check_microphone_available():
@@ -127,6 +113,64 @@ def mic_loop():
 
 
 # ══════════════════════════════════════════════
+# DISPLAY LOOP — runs on main thread
+# cv2 imshow/waitKey must be called from the
+# same thread (main) on Linux Qt/GTK backends.
+# _run() writes frames to shared memory,
+# this loop reads and renders them at ~30fps.
+# ══════════════════════════════════════════════
+def display_loop():
+    import cv2
+    import numpy as np
+    from modules.currency.currency_detector import get_latest_frame
+
+    window_open = False
+
+    # Blank "waiting" frame shown when detection is not running
+    waiting = np.zeros((540, 960, 3), dtype=np.uint8)
+    cv2.putText(waiting, "Waiting for currency detection...",
+                (160, 270), cv2.FONT_HERSHEY_SIMPLEX,
+                0.8, (80, 80, 80), 2, cv2.LINE_AA)
+
+    stopped = np.zeros((540, 960, 3), dtype=np.uint8)
+    cv2.putText(stopped, "Currency detection stopped",
+                (210, 270), cv2.FONT_HERSHEY_SIMPLEX,
+                0.8, (80, 80, 80), 2, cv2.LINE_AA)
+
+    logger.info("Display loop started on main thread")
+
+    while True:
+        frame = get_latest_frame()
+
+        if frame is not None:
+            # Live detection frame
+            if not window_open:
+                cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(WINDOW_NAME, 960, 540)
+                window_open = True
+                logger.info("Display: window opened")
+            cv2.imshow(WINDOW_NAME, frame)
+
+        elif window_open:
+            # Detection just stopped — show stopped frame
+            cv2.imshow(WINDOW_NAME, stopped)
+
+        # waitKey must be called continuously to keep Qt event loop alive
+        # even when no window is open yet
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') and window_open:
+            logger.info("'q' pressed — stopping currency detection")
+            try:
+                from modules.currency.currency_module import stop_currency_mode, currency_active
+                if currency_active:
+                    stop_currency_mode()
+            except Exception as e:
+                logger.warning(f"q-press stop error: {e}")
+
+        time.sleep(0.033)   # ~30 Hz is plenty for display
+
+
+# ══════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════
 if __name__ == "__main__":
@@ -136,36 +180,19 @@ if __name__ == "__main__":
     logger.info("    Press Ctrl+C to stop              ")
     logger.info("══════════════════════════════════════")
 
-    # Start mic loop in a daemon thread so the main thread stays free
-    # for cv2 GUI calls (Qt/GTK requires all imshow/waitKey on main thread)
+    # Mic loop in background thread — blocks on listen() so must not be main
     mic_thread = threading.Thread(target=mic_loop, daemon=True, name="MicLoop")
     mic_thread.start()
-    logger.info("Mic loop thread started ✓")
+    logger.info("Mic loop thread started")
 
     try:
-        # Main thread: pump cv2 display queue at ~30Hz.
-        # pump_display() is a no-op when currency is not running.
-        # If user presses 'q' in the cv2 window, treat it as stop signal.
-        while True:
-            try:
-                q_pressed = pump_display()
-                if q_pressed:
-                    logger.info("'q' pressed in cv2 window — stopping currency")
-                    try:
-                        from modules.currency.currency_module import stop_currency_mode, currency_active
-                        if currency_active:
-                            stop_currency_mode()
-                    except Exception as e:
-                        logger.warning(f"q-press stop error: {e}")
-            except Exception as e:
-                logger.warning(f"pump_display error: {e}")
-            time.sleep(0.033)   # ~30Hz — fast enough for smooth display
+        # Main thread owns all cv2 GUI calls
+        display_loop()
 
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt — shutting down")
         speaker.speak("Goodbye!")
 
-        # Stop currency detection if running
         try:
             from modules.currency.currency_module import stop_currency_mode, currency_active
             if currency_active:
@@ -173,21 +200,18 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-        # Shutdown Hailo device (only called once, here at exit)
         try:
             from modules.currency.currency_detector import shutdown as hailo_shutdown
             hailo_shutdown()
         except Exception:
             pass
 
-        # Shutdown shared camera manager
         try:
             from utils.camera_manager import camera_manager
             camera_manager.shutdown()
         except Exception:
             pass
 
-        # Close cv2 window from main thread (correct thread to call this)
         try:
             import cv2
             cv2.destroyAllWindows()
