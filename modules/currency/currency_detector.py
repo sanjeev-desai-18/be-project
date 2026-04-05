@@ -128,17 +128,18 @@ def pump_display():
         return q_pressed
 
     if item is None:
-        # Sentinel: detection stopped — show blank frame, keep window alive
+        # Sentinel: detection stopped — destroy window cleanly from main thread.
+        # Double waitKey(1) gives Qt two event loop ticks to fully process the
+        # destroy before namedWindow() can be called again next session.
         if _window_created:
             try:
-                blank = np.zeros((540, 960, 3), dtype=np.uint8)
-                cv2.putText(blank, "Currency detection stopped",
-                            (150, 270), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.9, (100, 100, 100), 2, cv2.LINE_AA)
-                cv2.imshow(WINDOW_NAME, blank)
+                cv2.destroyAllWindows()
                 cv2.waitKey(1)
-            except Exception:
-                pass
+                cv2.waitKey(1)
+                logger.info("pump_display: cv2 window destroyed ✓")
+            except Exception as e:
+                logger.warning(f"pump_display: window destroy error: {e}")
+            _window_created = False
         return q_pressed
 
     # Normal annotated frame
