@@ -1,5 +1,7 @@
 """
 modules/currency/currency_module.py
+─────────────────────────────────────
+Thread manager for currency detection.
 """
 import threading
 import time
@@ -13,6 +15,7 @@ def reset_currency_state():
     global currency_active
     with _lock:
         currency_active = False
+        logger.debug("currency_module: state reset to inactive")
 
 
 def start_currency_mode():
@@ -35,25 +38,29 @@ def stop_currency_mode():
 
     with _lock:
         if not currency_active:
-            logger.info("Currency not active")
+            logger.info("Currency not active — nothing to stop")
             return
         _det.stop_currency_detection()
         currency_active = False
+        logger.info("Currency stop signal sent ✓")
 
-    # Wait outside lock for clean thread exit
-    released = _det.wait_for_camera_release(timeout=2.0)
+    # Wait outside lock — allows start to proceed if called immediately after
+    released = _det.wait_for_camera_release(timeout=3.0)
 
     if not released:
-        # Thread is stuck in capture_array(). Fix:
-        # 1. Stop the camera from outside — this raises an exception
-        #    inside capture_array(), letting the thread exit its loop
-        # 2. Force-release the camera lock so next acquire() can proceed
-        logger.warning("Thread stuck in capture_array() — calling force_release()")
+        # Thread stuck — _capture_with_timeout should have prevented this,
+        # but as last resort: stop camera from outside to unblock it
+        logger.warning("Thread still stuck after 3s — calling force_release()")
         camera_manager.force_release()
 
-        # Give thread a moment to process the exception and exit
-        time.sleep(0.5)
+    # Join the thread so we know it's fully dead before reset
+    t = _det._thread
+    if t is not None and t.is_alive():
+        logger.info("Joining currency thread...")
+        t.join(timeout=3.0)
+        if t.is_alive():
+            logger.error("Thread still alive after join — resetting anyway")
 
-    # Always reset module state so next start() is a clean launch
+    # Full state reset — next start() gets a clean slate
     _det.reset()
     logger.info("Currency stopped and reset ✓")

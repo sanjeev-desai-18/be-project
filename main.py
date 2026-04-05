@@ -7,6 +7,13 @@ main.py — Blind Assistant entry point for Raspberry Pi 5 + Hailo 8 AI HAT
 - TTS output to Bluetooth earbuds via gTTS / ElevenLabs
 - CV2 window shows live bounding boxes during currency mode
 - Mic loop keeps running so user can switch modes at any time
+
+DISPLAY ARCHITECTURE:
+  cv2 GUI calls (namedWindow, imshow, waitKey) MUST run on the main thread
+  on Linux Qt/GTK backends. mic_loop() blocks for seconds inside listen(),
+  which starves the Qt event loop and causes the window to freeze/hang on
+  second launch. Fix: mic_loop() runs in a daemon thread. The main thread
+  does nothing except call pump_display() in a tight loop, keeping Qt alive.
 """
 
 import sys
@@ -30,6 +37,7 @@ from tts.speaker import Speaker
 from modules.stt.listener import listen
 from core.agent import agent
 from core.state import AssistantState
+from modules.currency.currency_detector import pump_display
 
 speaker = Speaker()
 
@@ -93,7 +101,8 @@ def run_pipeline(transcript: str) -> None:
 
 
 # ══════════════════════════════════════════════
-# MIC LOOP — always-on, never blocks on currency
+# MIC LOOP — runs in a background thread
+# Main thread must stay free for cv2 GUI calls
 # ══════════════════════════════════════════════
 def mic_loop():
     if not check_microphone_available():
@@ -127,8 +136,31 @@ if __name__ == "__main__":
     logger.info("    Press Ctrl+C to stop              ")
     logger.info("══════════════════════════════════════")
 
+    # Start mic loop in a daemon thread so the main thread stays free
+    # for cv2 GUI calls (Qt/GTK requires all imshow/waitKey on main thread)
+    mic_thread = threading.Thread(target=mic_loop, daemon=True, name="MicLoop")
+    mic_thread.start()
+    logger.info("Mic loop thread started ✓")
+
     try:
-        mic_loop()
+        # Main thread: pump cv2 display queue at ~30Hz.
+        # pump_display() is a no-op when currency is not running.
+        # If user presses 'q' in the cv2 window, treat it as stop signal.
+        while True:
+            try:
+                q_pressed = pump_display()
+                if q_pressed:
+                    logger.info("'q' pressed in cv2 window — stopping currency")
+                    try:
+                        from modules.currency.currency_module import stop_currency_mode, currency_active
+                        if currency_active:
+                            stop_currency_mode()
+                    except Exception as e:
+                        logger.warning(f"q-press stop error: {e}")
+            except Exception as e:
+                logger.warning(f"pump_display error: {e}")
+            time.sleep(0.033)   # ~30Hz — fast enough for smooth display
+
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt — shutting down")
         speaker.speak("Goodbye!")
@@ -155,7 +187,7 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-        # Close any open CV2 windows
+        # Close cv2 window from main thread (correct thread to call this)
         try:
             import cv2
             cv2.destroyAllWindows()

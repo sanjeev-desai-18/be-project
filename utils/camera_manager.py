@@ -1,4 +1,32 @@
 # utils/camera_manager.py
+#
+# Singleton Picamera2.
+#
+# WHY _verify_frames_flowing() WAS REMOVED:
+# ──────────────────────────────────────────
+# _verify_frames_flowing() called capture_array() in a daemon thread to
+# confirm the pipeline was live. The problem: cam.stop() (called in release())
+# does NOT interrupt a thread already blocked inside capture_array(). So on
+# second launch the ghost verification thread from session 1 was still alive
+# and blocked inside capture_array() when session 2 called cam.configure()
+# and cam.start() underneath it. Session 2 then spawned its own verification
+# thread, resulting in two concurrent threads hitting picamera2's internal
+# request queue simultaneously — corrupting it. Every capture in the second
+# session's detection loop then returned immediately with an error or None,
+# making the loop spin at 100% CPU and produce zero detections.
+#
+# The fix: replace pre-verification with a longer sleep warmup. The detection
+# loop's _capture_with_timeout() already handles stalls gracefully — if the
+# first few frames are bad, it logs and continues. No pre-verification needed.
+#
+# HOW SECOND-LAUNCH STALLS ARE NOW HANDLED:
+# ──────────────────────────────────────────
+# _configure() always does stop() + 0.3s sleep before reconfigure, which
+# clears picamera2's internal request queue. acquire() then sleeps warmup
+# seconds (1.0s for currency) after start(). By the time _run()'s first
+# _capture_with_timeout() fires, the pipeline has had 1.3s to stabilise.
+# If a frame still doesn't arrive within 1s, _capture_with_timeout() returns
+# ("timeout") and the loop retries — no hang, no ghost threads.
 
 import threading
 import time
@@ -22,12 +50,19 @@ class CameraManager:
 
     def _configure(self, mode: str, model_size: tuple = (640, 640)):
         cam = self._get_picam2()
+
+        # Always do a full stop before reconfiguring — clears request queue.
         if self._started:
             try:
                 cam.stop()
+                logger.info("CameraManager: stopped before reconfigure")
             except Exception:
                 pass
             self._started = False
+
+        # Brief sleep after stop lets picamera2 flush any stale requests
+        # that were queued before stop() was called.
+        time.sleep(0.3)
 
         if mode == "currency":
             w, h = model_size
@@ -45,23 +80,38 @@ class CameraManager:
         logger.info(f"CameraManager: configured for mode='{mode}'")
 
     def acquire(self, mode: str, model_size: tuple = (640, 640),
-                warmup: float = 0.8) -> "Picamera2":
-        self._lock.acquire()
+                warmup: float = 0.8, lock_timeout: float = 10.0) -> "Picamera2":
+        # Use a timeout so callers (scene, reading) never freeze indefinitely
+        # if the currency thread is slow to release. 10s is generous — currency
+        # stop + camera release normally completes in under 4s.
+        if not self._lock.acquire(timeout=lock_timeout):
+            raise RuntimeError(
+                f"CameraManager: could not acquire lock in {lock_timeout}s — "
+                "another module may still be holding the camera"
+            )
         try:
             self._configure(mode, model_size)
             cam = self._get_picam2()
+
             cam.start()
             self._started = True
-            logger.info(f"CameraManager: started mode='{mode}', warming up {warmup}s")
+            logger.info(
+                f"CameraManager: started mode='{mode}', warming up {warmup}s"
+            )
+            # Sleep-only warmup. Do NOT call capture_array() here.
+            # Any capture_array() call in a thread at this point can outlive
+            # release() and corrupt the next session's request queue.
+            # The detection loop's _capture_with_timeout() handles stalls.
             time.sleep(warmup)
-            for _ in range(3):
-                try:
-                    cam.capture_array("main")
-                except Exception:
-                    pass
+
+            logger.info("CameraManager: acquire complete ✓")
             return cam
+
         except Exception as e:
-            self._lock.release()
+            try:
+                self._lock.release()
+            except RuntimeError:
+                pass
             logger.error(f"CameraManager.acquire() failed: {e}")
             raise RuntimeError(f"Camera acquire failed: {e}") from e
 
@@ -80,52 +130,19 @@ class CameraManager:
                 pass
 
     def force_release(self):
-        """
-        Call this when the thread holding the camera is stuck in capture_array()
-        and will never call release() itself.
-
-        Strategy:
-          1. Call picam2.stop() — this terminates the libcamera pipeline and
-             causes any blocked capture_array() to raise an exception, which
-             lets the stuck thread exit its loop and reach its finally block.
-          2. Force-release the lock regardless of who holds it, so the next
-             acquire() can proceed.
-
-        This is safe because:
-          - picam2.stop() is idempotent (calling it twice is harmless)
-          - The stuck thread's finally block calls release() which calls
-            stop() again (no-op) and tries lock.release() (RuntimeError
-            caught and ignored)
-          - The Picamera2 instance stays alive — only streaming stops
-        """
-        logger.warning("CameraManager: force_release() called — stopping camera to unblock stuck thread")
-
-        # Step 1: stop the camera — this unblocks capture_array() in the stuck thread
+        logger.warning("CameraManager: force_release() called")
         try:
             if self._picam2 is not None:
                 self._picam2.stop()
                 self._started = False
-                logger.info("CameraManager: force-stopped streaming ✓")
+                logger.info("CameraManager: force-stopped ✓")
         except Exception as e:
             logger.warning(f"CameraManager: force stop error: {e}")
-
-        # Step 2: give the stuck thread a moment to receive the exception
-        # and exit its loop before we release the lock
         time.sleep(0.3)
-
-        # Step 3: force-release the lock
-        # threading.Lock has no "force release" — we release it only if
-        # we can determine it's locked. We do this by trying to acquire
-        # with timeout=0. If it succeeds, the lock was FREE (release it
-        # back). If it fails, lock is HELD — release it.
         acquired = self._lock.acquire(blocking=False)
         if acquired:
-            # Lock was free — we just grabbed it, release it back
             self._lock.release()
-            logger.info("CameraManager: lock was already free")
         else:
-            # Lock is held by stuck thread — force release
-            # threading.Lock allows release from any thread in Python
             try:
                 self._lock.release()
                 logger.info("CameraManager: lock force-released ✓")
