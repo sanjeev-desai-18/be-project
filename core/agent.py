@@ -72,41 +72,22 @@ def _parse_llm_json(raw: str) -> dict:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CAMERA OWNERSHIP HELPER
-#
-# The camera is a single shared resource (camera_manager singleton).
-# Currency detection holds the camera lock continuously while running.
-# Scene and reading need the camera for a brief one-shot capture.
-#
-# Rule: before any module calls camera_manager.acquire(), currency MUST be
-# stopped and the camera lock must be free.
-#
-# _stop_currency_if_running() is called at the start of scene_node and
-# reading_node. It is a no-op if currency is not active.
 # ══════════════════════════════════════════════════════════════════════════════
 def _stop_currency_if_running() -> bool:
     """
-    Stop currency detection if it is currently active and wait for the camera
-    to be fully released before returning.
-
-    Returns True if currency was stopped (camera is now free).
-    Returns False if currency was not running (camera was already free).
+    Stop currency detection if active and wait for camera to be fully released.
+    Returns True if currency was stopped, False if it wasn't running.
     """
     try:
         import modules.currency.currency_module as _cm
         import modules.currency.currency_detector as _det
 
         if not _cm.currency_active:
-            # Currency not running — camera is free, nothing to do
             return False
 
         logger.info("Camera requested by another module — stopping currency first...")
-
-        # Signal currency thread to stop and release the camera.
-        # stop_currency_mode() releases _lock before waiting, so no deadlock.
         _cm.stop_currency_mode()
 
-        # wait_for_camera_release() already called inside stop_currency_mode(),
-        # but call again with a short timeout as a safety double-check.
         released = _det._camera_released.wait(timeout=2.0)
         if not released:
             logger.error("Camera still not released after stop — proceeding anyway")
@@ -154,7 +135,7 @@ def interpret_intent_node(state: AssistantState) -> AssistantState:
         extra      = str(result.get("extra_context", "")).strip()
 
         if mode not in VALID_MODES:
-            logger.warning(f"Unexpected mode '{mode}' from LLM — falling back to unknown")
+            logger.warning(f"Unexpected mode '{mode}' — falling back to unknown")
             mode = "unknown"
 
         logger.info(f"Agent → mode: {mode} | confidence: {confidence:.2f}")
@@ -210,51 +191,61 @@ def route_to_module(state: AssistantState) -> str:
 
 # ═══════════════════════════════════════════════
 # NODE 3a — Scene
-# Stops currency first if running, then captures scene.
-# After scene is done, camera is released — currency does NOT auto-restart.
-# User must say "paisa check" again to restart currency mode.
 # ═══════════════════════════════════════════════
 def scene_node(state: AssistantState) -> AssistantState:
     from modules.scene.scene_module import SceneModule
+    from tts.speaker import Speaker
     logger.info("Executing Scene module")
 
-    # Stop currency and free the camera before we try to acquire it
     _stop_currency_if_running()
 
+    sp = Speaker()
+
+    # Immediate ACK — user hears this within ~200ms of routing completing,
+    # while the camera is still warming up and the VLM hasn't been called yet.
+    sp.speak("Looking at your surroundings.")
+
     try:
-        result = SceneModule().run()
+        # speaker=sp causes each sentence to be spoken as it streams.
+        result = SceneModule().run(speaker=sp)
     except Exception as e:
         logger.error(f"Scene module error: {e}", exc_info=True)
         result = "I was unable to analyse the scene."
+        sp.speak_stream(result)
 
-    return {**state, "final_output": result}
+    # spoken=True tells tts_node to skip — audio already played sentence by sentence.
+    return {**state, "final_output": result, "spoken": True}
 
 
 # ═══════════════════════════════════════════════
 # NODE 3b — Reading
-# Stops currency first if running, then captures frame for OCR.
-# After reading is done, camera is released — currency does NOT auto-restart.
 # ═══════════════════════════════════════════════
 def reading_node(state: AssistantState) -> AssistantState:
     from modules.reading.reading_module import ReadingModule
+    from tts.speaker import Speaker
     logger.info("Executing Reading module")
 
-    # Stop currency and free the camera before we try to acquire it
     _stop_currency_if_running()
 
+    sp = Speaker()
+
+    # Immediate ACK
+    sp.speak("Reading now.")
+
     try:
-        result = ReadingModule().run()
+        # speaker=sp causes each sentence to be spoken as it streams.
+        result = ReadingModule().run(speaker=sp)
     except Exception as e:
         logger.error(f"Reading module error: {e}", exc_info=True)
         result = "I could not read the text."
+        sp.speak_stream(result)
 
-    return {**state, "final_output": result}
+    # spoken=True — tts_node will skip re-speaking.
+    return {**state, "final_output": result, "spoken": True}
 
 
 # ═══════════════════════════════════════════════
 # NODE 3c — Currency
-# Starts currency detection from scratch.
-# If already running (shouldn't happen, but guard anyway), skip.
 # ═══════════════════════════════════════════════
 def currency_node(state: AssistantState) -> AssistantState:
     from modules.currency.currency_module import start_currency_mode, currency_active
@@ -277,7 +268,6 @@ def currency_node(state: AssistantState) -> AssistantState:
 
 # ═══════════════════════════════════════════════
 # NODE 3d — Stop
-# Explicit user "stop" command.
 # ═══════════════════════════════════════════════
 def stop_node(state: AssistantState) -> AssistantState:
     from modules.currency.currency_module import stop_currency_mode, currency_active
@@ -300,7 +290,6 @@ def stop_node(state: AssistantState) -> AssistantState:
 
 # ═══════════════════════════════════════════════
 # NODE 3e — Knowledge
-# No camera involved — runs freely regardless of currency state.
 # ═══════════════════════════════════════════════
 def knowledge_node(state: AssistantState) -> AssistantState:
     from modules.knowledge.knowledge_logic import handle_knowledge_query
@@ -333,8 +322,9 @@ def greeting_node(state: AssistantState) -> AssistantState:
 def tts_node(state: AssistantState) -> AssistantState:
     from tts.speaker import Speaker
 
-    # If module already spoke (e.g. knowledge_node handles its own TTS), skip
+    # Skip if the module already spoke (scene_node / reading_node stream directly)
     if state.get("spoken"):
+        logger.debug("tts_node: spoken=True — skipping (audio already played)")
         return state
 
     output = state.get("final_output", "").strip()

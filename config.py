@@ -26,15 +26,23 @@ CONFIDENCE_MEDIUM   = 0.50
 
 # ── Vision / VLM (Groq vision model) ─────────────────────────────────────────
 VLM_MODEL           = "meta-llama/llama-4-scout-17b-16e-instruct"
-VLM_MAX_TOKENS      = 200
+VLM_MAX_TOKENS      = 300        # slightly higher to allow complete sentences
 CAMERA_INDEX        = 0
 CAMERA_WARMUP_MS    = 500
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
-# Use "gtts" for offline / free, "elevenlabs" for higher quality
+# Options:
+#   "pyttsx3"    — offline, zero-latency (espeak-ng on Pi). Recommended.
+#                  Install: pip install pyttsx3 && sudo apt install espeak-ng
+#   "gtts"       — Google TTS, online, saves to disk first (~1-3s extra)
+#   "elevenlabs" — highest quality, requires API key
 TTS_ENGINE          = "gtts"
 TTS_LANGUAGE        = "en"
 TTS_SLOW            = False
+
+# pyttsx3 settings (only used when TTS_ENGINE = "pyttsx3")
+PYTTSX3_RATE        = 165        # words per minute — lower = slower/clearer
+PYTTSX3_VOLUME      = 1.0        # 0.0 to 1.0
 
 # ── Currency / Hailo 8 ────────────────────────────────────────────────────────
 HAILO_HEF_PATH      = os.path.join(
@@ -43,3 +51,6 @@ HAILO_HEF_PATH      = os.path.join(
 )
 CURRENCY_CONFIDENCE = 0.50
 CURRENCY_MAX_FPS    = 30
+
+# ── NoIR Camera Correction ────────────────────────────────────────────────────
+NOIR_CORRECTION     = True
