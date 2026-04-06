@@ -49,8 +49,8 @@ HAILO_HEF_PATH      = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "modules", "currency", "yolov11s_currency.hef"
 )
-CURRENCY_CONFIDENCE = 0.50
+CURRENCY_CONFIDENCE = 0.70
 CURRENCY_MAX_FPS    = 30
 
 # ── NoIR Camera Correction ────────────────────────────────────────────────────
-NOIR_CORRECTION     = True
+NOIR_CORRECTION     = False
