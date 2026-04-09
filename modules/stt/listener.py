@@ -125,7 +125,10 @@ def listen() -> str:
     if _MIC_DEVICE is not None:
         open_kwargs["device"] = _MIC_DEVICE
 
-    speech_threshold = _NOISE_BASELINE
+    # Clamp threshold: at least 0.20 (reject quiet noise),
+    # at most 0.32 (don't make detection too hard in noisy rooms)
+    speech_threshold = float(np.clip(_NOISE_BASELINE, 0.20, 0.32))
+    logger.debug(f"Speech threshold clamped to {speech_threshold:.3f}  (raw baseline {_NOISE_BASELINE:.5f})")
 
     audio_chunks     = []
     silence_chunks   = 0
@@ -169,11 +172,18 @@ def listen() -> str:
 
     full_audio = np.concatenate(audio_chunks)
 
-    if len(full_audio) < SAMPLE_RATE * 0.3:
+    if len(full_audio) < SAMPLE_RATE * 0.5:
         logger.warning("Recording too short â€” skipping")
         return ""
 
-    return _transcribe_numpy(full_audio, SAMPLE_RATE)
+    transcript = _transcribe_numpy(full_audio, SAMPLE_RATE)
+
+    # Discard very short / nonsensical transcriptions (noise artefacts)
+    if transcript and len(transcript.split()) < 2:
+        logger.warning(f"Transcript too short ('{transcript}') -- discarding as noise")
+        return ""
+
+    return transcript
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -201,7 +211,7 @@ def listen_from_file(path: str) -> str:
         transcription = _client.audio.transcriptions.create(
             file=(filename, raw_bytes, mime),
             model="whisper-large-v3",
-            language=None,
+            language="en",
             response_format="text",
         )
         transcript = transcription.strip() if transcription else ""
@@ -237,7 +247,7 @@ def _transcribe_numpy(audio: np.ndarray, source_rate: int) -> str:
         transcription = _client.audio.transcriptions.create(
             file=("audio.wav", wav_buffer, "audio/wav"),
             model="whisper-large-v3",
-            language=None,
+            language="en",
             response_format="text",
         )
         transcript = transcription.strip() if transcription else ""
