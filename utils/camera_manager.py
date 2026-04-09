@@ -2,6 +2,12 @@
 #
 # Singleton Picamera2.
 #
+# FORMAT NOTE:
+# Picamera2's "RGB888" format returns BGR byte order (DRM convention).
+# This is OpenCV's native format — we can use frames directly with
+# cv2.imshow / cv2.imencode without colour conversion.
+# For Hailo inference (expects RGB), convert BGR→RGB before hailo.run().
+#
 # WHY _verify_frames_flowing() WAS REMOVED:
 # ──────────────────────────────────────────
 # _verify_frames_flowing() called capture_array() in a daemon thread to

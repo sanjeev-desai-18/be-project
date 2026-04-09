@@ -52,5 +52,4 @@ HAILO_HEF_PATH      = os.path.join(
 CURRENCY_CONFIDENCE = 0.70
 CURRENCY_MAX_FPS    = 30
 
-# ── NoIR Camera Correction ────────────────────────────────────────────────────
-NOIR_CORRECTION     = False
+

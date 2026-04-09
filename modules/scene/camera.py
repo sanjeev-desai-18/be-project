@@ -4,34 +4,14 @@
 # On RPi 5 with the official camera module, picamera2 is the correct driver.
 # cv2.VideoCapture() does NOT reliably access the CSI camera on RPi 5.
 #
-# NoIR correction is applied (CLAHE on L-channel in LAB space) so frames sent
-# to the VLM resemble normal RGB images — the model was trained on RGB data.
-# Disable by setting NOIR_CORRECTION = False in config.py.
+# Picamera2's "RGB888" format returns BGR byte order (DRM convention),
+# which is OpenCV's native format — no colour conversion needed.
 
 import time
 import cv2
-import numpy as np
 
 from utils.logger import logger
 from utils.image_utils import frame_to_base64, resize_frame
-
-
-def _apply_noir_correction(frame_rgb: np.ndarray) -> np.ndarray:
-    """
-    Lightweight CLAHE colour correction for NoIR camera frames.
-    Equalises the L-channel in LAB space. < 1 ms on RPi 5.
-    Input/output: RGB numpy array.
-    """
-    try:
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        lab   = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2LAB)
-        l, a, b = cv2.split(lab)
-        l = clahe.apply(l)
-        lab = cv2.merge((l, a, b))
-        return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-    except Exception as e:
-        logger.warning(f"NoIR correction failed — returning raw frame: {e}")
-        return frame_rgb
 
 
 def capture_frame_as_base64() -> str:
@@ -52,11 +32,6 @@ def capture_frame_as_base64() -> str:
             "Install with: sudo apt install python3-picamera2"
         )
 
-    try:
-        _noir_correction = __import__("config").NOIR_CORRECTION
-    except AttributeError:
-        _noir_correction = True  # default on
-
     logger.debug("Opening camera via picamera2 for scene capture...")
 
     picam2 = Picamera2()
@@ -74,7 +49,7 @@ def capture_frame_as_base64() -> str:
         for _ in range(3):
             picam2.capture_array("main")
 
-        frame = picam2.capture_array("main")  # RGB888 numpy array
+        frame = picam2.capture_array("main")
 
     except Exception as e:
         raise RuntimeError(f"picamera2 capture failed: {e}") from e
@@ -88,13 +63,9 @@ def capture_frame_as_base64() -> str:
     if frame is None:
         raise RuntimeError("Camera returned an empty frame.")
 
-    if _noir_correction:
-        logger.debug("Applying NoIR colour correction to scene frame")
-        frame = _apply_noir_correction(frame)
-
-    # Convert RGB → BGR for OpenCV resize/encode pipeline
-    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    frame_bgr = resize_frame(frame_bgr, max_width=1024)
+    # RGB888 gives BGR natively (DRM convention) — OpenCV native format
+    # No colour conversion needed for imencode
+    frame_bgr = resize_frame(frame, max_width=1024)
     b64       = frame_to_base64(frame_bgr, quality=85)
 
     logger.debug("Scene frame captured and encoded ✓")

@@ -12,23 +12,15 @@
 #   5. run() returns spoken=True signal so tts_node skips re-speaking.
 
 import cv2
-import numpy as np
 
 from modules.scene.vlm_client import VLMClient
 from utils.logger import logger
+
 from utils.image_utils import frame_to_base64, resize_frame
 from utils.camera_manager import camera_manager
 
 
-def _apply_noir_correction(frame_rgb: np.ndarray) -> np.ndarray:
-    try:
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        lab   = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2LAB)
-        l, a, b = cv2.split(lab)
-        l = clahe.apply(l)
-        return cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2RGB)
-    except Exception:
-        return frame_rgb
+
 
 
 # Plain-prose prompt — works with streaming, faster to generate than JSON,
@@ -48,10 +40,6 @@ class SceneModule:
         self.vlm = VLMClient()
 
     def _capture_frames(self, count: int = 1) -> list:
-        try:
-            _noir = __import__("config").NOIR_CORRECTION
-        except AttributeError:
-            _noir = True
 
         frames = []
         # warmup=0.3 — reduced from 0.8. Camera is already initialised from
@@ -60,10 +48,8 @@ class SceneModule:
         try:
             for i in range(count):
                 raw = picam2.capture_array("main")
-                if _noir:
-                    raw = _apply_noir_correction(raw)
-                bgr = cv2.cvtColor(raw, cv2.COLOR_RGB2BGR)
-                bgr = resize_frame(bgr, max_width=1024)
+                # RGB888 gives BGR natively (DRM convention) — OpenCV native
+                bgr = resize_frame(raw, max_width=1024)
                 frames.append(frame_to_base64(bgr, quality=85))
                 logger.debug(f"Scene frame {i+1}/{count} captured ✓")
         finally:

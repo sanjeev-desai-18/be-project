@@ -211,12 +211,7 @@ def _run(stop_evt, camera_released_evt):
         camera_released_evt.set()
         return
 
-    try:
-        _noir = getattr(__import__("config"), "NOIR_CORRECTION", True)
-    except Exception:
-        _noir = True
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)) if _noir else None
-    logger.info(f"_run(): NOIR_CORRECTION={_noir}, entering detection loop")
+    logger.info("_run(): entering detection loop")
 
     fps_t=time.time(); fps_count=0; fps=0.0
 
@@ -230,15 +225,17 @@ def _run(stop_evt, camera_released_evt):
             if frame is None:
                 continue
 
+            # RGB888 format gives BGR byte order (DRM convention)
+            # which is OpenCV's native format — no conversion needed for display.
+            # But Hailo model expects RGB, so convert for inference only.
+            if frame.ndim == 3 and frame.shape[2] == 4:
+                frame = frame[:, :, :3]
+
             img_h, img_w = frame.shape[:2]
 
-            if _noir and clahe is not None:
-                lab=cv2.cvtColor(frame,cv2.COLOR_RGB2LAB)
-                l,a,b=cv2.split(lab)
-                l=clahe.apply(l)
-                frame=cv2.cvtColor(cv2.merge((l,a,b)),cv2.COLOR_LAB2RGB)
-
-            hailo_output = hailo.run(frame)
+            # frame is BGR; Hailo expects RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            hailo_output = hailo.run(frame_rgb)
             detections   = _parse_hailo_output(hailo_output, img_w, img_h)
             if detections:
                 logger.info(f"Detected: {[d['class'] for d in detections]}")
@@ -249,9 +246,8 @@ def _run(stop_evt, camera_released_evt):
             if time.time()-fps_t>=2.0:
                 fps=fps_count/(time.time()-fps_t); fps_count=0; fps_t=time.time()
 
-            # Write annotated frame for main thread to display
-            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            _set_latest_frame(_draw_boxes(bgr, detections, fps))
+            # frame is already BGR — use directly for display
+            _set_latest_frame(_draw_boxes(frame, detections, fps))
 
     except Exception as e:
         logger.error(f"_run(): loop exception: {e}", exc_info=True)
