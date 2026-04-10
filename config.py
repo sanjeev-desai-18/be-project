@@ -49,7 +49,7 @@ HAILO_HEF_PATH      = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "modules", "currency", "yolov11s_currency.hef"
 )
-CURRENCY_CONFIDENCE = 0.70
+CURRENCY_CONFIDENCE = 0.8
 CURRENCY_MAX_FPS    = 30
 
 
