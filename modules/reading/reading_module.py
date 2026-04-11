@@ -1,16 +1,22 @@
 # modules/reading/reading_module.py
 #
-# Changes from original:
-#   1. _capture_frames(count=2) — reduced from 3. Two frames is enough for
-#      sharpness selection. Removes one 0.2s inter-frame sleep. Saves ~0.4s.
-#   2. warmup reduced from 1.0s → 0.4s in acquire(). Saves ~0.6s.
-#   3. Groq Vision called with stream=True — tokens are buffered into sentences
-#      and each sentence is spoken immediately via speaker.speak().
-#      User hears first sentence in ~2-3s, rest plays while VLM generates.
-#   4. run() accepts optional speaker= argument (same pattern as scene_module).
+# Changes from previous version:
+#   1. run() now uses a 1.5s initial collection buffer before starting TTS —
+#      same pipeline as scene_module.  The VLM stream is consumed in a
+#      background thread; the main thread waits 1.5s, joins accumulated
+#      sentences into one first chunk, speaks it, then streams the rest.
+#
+#      Result: no more cut-off words / mid-word TTS artefacts on the first
+#      chunk.  The reading response can be long (medicine labels, receipts)
+#      so the pipeline ensures continuous playback without gaps.
+#
+#   2. All other behaviour (camera capture, sharpness selection, Groq Vision
+#      call, prompt, logging) is unchanged.
 
 import base64
-import time
+import threading
+import queue as _queue
+import time as _time
 
 import cv2
 import numpy as np
@@ -25,8 +31,8 @@ from config import GROQ_API_KEY, VLM_MODEL, VLM_MAX_TOKENS
 _SENTENCE_ENDS = frozenset({".", "!", "?", "\n"})
 _CLAUSE_MIN_LEN = 40   # only split on comma/semicolon after this many chars
 
-
-
+# How long (seconds) to buffer VLM output before speaking the first chunk.
+_INITIAL_BUFFER_S = 1.5
 
 
 _READING_PROMPT = """\
@@ -57,23 +63,18 @@ class ReadingModule:
             return 0.0
 
     def _capture_frames(self, count: int = 2) -> list:
-
         frames = []
-        # warmup=0.4 — reduced from 1.0. Reading mode uses still config which
-        # stabilises quickly. 400ms is enough in practice on Pi 5.
         picam2 = camera_manager.acquire(mode="reading", warmup=0.4)
         try:
             for i in range(count):
                 raw = picam2.capture_array("main")
-                # RGB888 gives BGR natively (DRM convention) — OpenCV native
                 bgr = resize_frame(raw, max_width=1920)
                 frames.append(frame_to_base64(bgr, quality=92))
                 logger.debug(f"Reading frame {i+1}/{count} captured ✓")
                 if i < count - 1:
-                    time.sleep(0.15)   # reduced from 0.2s
+                    _time.sleep(0.15)
         finally:
             camera_manager.release()
-
         return frames
 
     def _pick_sharpest(self, frames: list) -> str:
@@ -92,12 +93,22 @@ class ReadingModule:
         Capture frames, pick the sharpest, and read all visible text.
 
         Args:
-            speaker: optional Speaker instance. When provided, each sentence
-                     is spoken immediately as it streams from the VLM.
+            speaker: optional Speaker instance.  When provided, uses the
+                     two-phase buffered pipeline:
+
+                     Phase 1 — silent collection (up to 1.5 s):
+                       VLM tokens are buffered into sentences and collected
+                       without speaking.  This ensures TTS never starts on
+                       a partial word or incomplete sentence.
+
+                     Phase 2 — speak + pipeline:
+                       All buffered sentences are joined and spoken as one
+                       clean first chunk.  Remaining sentences are spoken
+                       immediately as they arrive from the VLM.
 
         Returns:
             Full reading text (used for logging / state).
-            If speaker was provided, audio has already been played — caller
+            If speaker was provided, audio has already been queued — caller
             should set spoken=True in state to skip tts_node.
         """
         logger.info("ReadingModule.run() | capturing frames via camera_manager")
@@ -116,17 +127,15 @@ class ReadingModule:
 
         logger.info("Sending frame to Groq Vision (streaming)...")
 
-        full_text      = ""
-        sentence_count = 0
-        buffer         = ""
+        full_text = ""
 
-        try:
+        # ── Build the Groq streaming generator ───────────────────────────────
+        def _make_stream():
             from groq import Groq
             client = Groq(api_key=GROQ_API_KEY)
-
-            stream = client.chat.completions.create(
+            return client.chat.completions.create(
                 model=VLM_MODEL,
-                max_tokens=2048,   # reading may need more tokens than scene
+                max_tokens=2048,
                 stream=True,
                 timeout=30,
                 messages=[{
@@ -139,64 +148,126 @@ class ReadingModule:
                 }]
             )
 
+        def _iter_sentences(stream):
+            """
+            Consume the raw Groq stream and yield complete sentences / clauses,
+            using the same buffering logic as the original reading_module.
+            """
+            buffer = ""
             for chunk in stream:
                 delta = chunk.choices[0].delta.content
                 if delta is None:
                     continue
-
                 buffer += delta
 
-                # Drain complete sentences from the front of the buffer
                 while True:
                     idx = -1
                     for i, ch in enumerate(buffer):
                         if ch in _SENTENCE_ENDS:
                             idx = i
                             break
-                        # split on comma/semicolon only for long buffers
                         if ch in {",", ";"} and i >= _CLAUSE_MIN_LEN:
                             idx = i
                             break
-
                     if idx == -1:
                         break
-
                     sentence = buffer[:idx + 1].strip()
                     buffer   = buffer[idx + 1:].lstrip()
-
                     if sentence:
-                        full_text += (" " if full_text else "") + sentence
-                        sentence_count += 1
-                        if speaker:
-                            speaker.speak_stream(sentence)
-                            logger.debug(
-                                f"Reading sentence {sentence_count} spoken: "
-                                f"'{sentence[:60]}'"
-                            )
+                        yield sentence
 
-            # Flush remainder
             remainder = buffer.strip()
             if remainder:
-                full_text += (" " if full_text else "") + remainder
-                sentence_count += 1
-                if speaker:
-                    speaker.speak_stream(remainder)
+                yield remainder
 
-        except Exception as e:
-            logger.error(f"Groq Vision streaming failed: {e}")
-            fallback = "I could not read the text. Please try again."
-            if speaker:
-                speaker.speak_stream(fallback)
-            return fallback
+        if speaker:
+            # ── Streaming pipeline with initial buffer ────────────────────
+            sentence_q = _queue.Queue()
 
-        if not full_text.strip():
-            fallback = "I could not read any text from the image. Please try again."
-            if speaker:
+            def _generate():
+                try:
+                    stream = _make_stream()
+                    for sentence in _iter_sentences(stream):
+                        sentence_q.put(sentence)
+                except Exception as e:
+                    logger.error(f"Groq Vision streaming failed in ReadingModule: {e}")
+                finally:
+                    sentence_q.put(None)  # sentinel
+
+            gen_thread = threading.Thread(target=_generate, daemon=True,
+                                          name="reading-vlm-gen")
+            gen_thread.start()
+
+            # Phase 1: collect for _INITIAL_BUFFER_S before speaking
+            initial_sentences = []
+            deadline = _time.monotonic() + _INITIAL_BUFFER_S
+            done_early = False
+
+            while True:
+                remaining = deadline - _time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    item = sentence_q.get(timeout=remaining)
+                    if item is None:
+                        done_early = True
+                        break
+                    initial_sentences.append(item)
+                except _queue.Empty:
+                    break
+
+            # Speak the buffered content as a single chunk (clean, no artefacts)
+            if initial_sentences:
+                first_chunk = " ".join(initial_sentences)
+                full_text = first_chunk
+                speaker.speak_stream(first_chunk)
+                logger.debug(
+                    f"Reading initial chunk spoken ({len(initial_sentences)} "
+                    f"sentences, {len(first_chunk)} chars)"
+                )
+
+            # Phase 2: stream and speak remaining sentences
+            if not done_early:
+                sentence_count = len(initial_sentences)
+                while True:
+                    try:
+                        item = sentence_q.get(timeout=30)
+                        if item is None:
+                            break
+                        full_text += (" " if full_text else "") + item
+                        sentence_count += 1
+                        speaker.speak_stream(item)
+                        logger.debug(
+                            f"Reading sentence {sentence_count} spoken: "
+                            f"'{item[:60]}'"
+                        )
+                    except _queue.Empty:
+                        logger.warning("Reading VLM stream timed out waiting for next sentence")
+                        break
+
+            gen_thread.join(timeout=60)
+
+            if not full_text.strip():
+                fallback = "I could not read any text from the image. Please try again."
                 speaker.speak_stream(fallback)
-            return fallback
+                return fallback
+
+        else:
+            # No speaker — collect the full text
+            sentence_count = 0
+            try:
+                stream = _make_stream()
+                for sentence in _iter_sentences(stream):
+                    full_text += (" " if full_text else "") + sentence
+                    sentence_count += 1
+            except Exception as e:
+                logger.error(f"Groq Vision streaming failed: {e}")
+                return "I could not read the text. Please try again."
+
+            if not full_text.strip():
+                return "I could not read any text from the image. Please try again."
 
         logger.info(
-            f"Reading complete — {sentence_count} sentences, "
-            f"{len(full_text)} chars"
+            f"Reading complete — {len(full_text)} chars"
         )
         return full_text.strip()

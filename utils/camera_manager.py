@@ -77,6 +77,11 @@ class CameraManager:
         elif mode == "reading":
             config = cam.create_still_configuration(
                 main={"size": (1920, 1080), "format": "RGB888"})
+        elif mode == "scene":
+            # Full native resolution — imx708_wide_noir selects 2304x1296
+            # sensor mode when asked for this size (score 1000 = exact match).
+            config = cam.create_still_configuration(
+                main={"size": (2304, 1296), "format": "RGB888"})
         else:
             config = cam.create_preview_configuration(
                 main={"size": (1024, 768), "format": "RGB888"})

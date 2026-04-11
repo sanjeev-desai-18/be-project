@@ -1,12 +1,15 @@
 # modules/scene/vlm_client.py
 #
-# Vision client using Groq's vision model.
+# Changes from previous version:
+#   1. _CLAUSE_ENDS (comma / semicolon splits) removed entirely.
+#      They produced mid-sentence fragments like "There is a chair,"
+#      which gTTS renders with an awkward hang before the next call.
+#      Only true sentence-end punctuation (.!?\n) triggers a yield.
 #
-# Two methods:
-#   describe()        — blocking, returns full string. Used as fallback.
-#   describe_stream() — generator, yields sentences as they arrive from the API.
-#                       Use this for lowest latency — caller speaks each sentence
-#                       immediately instead of waiting for the full response.
+#   2. Remainder flush: if the VLM finishes without a terminal punctuation
+#      mark (common — models often drop the final period), a "." is appended
+#      before yielding so gTTS synthesises a clean, complete-sounding phrase
+#      instead of cutting off the last phoneme.
 
 import time
 from groq import Groq
@@ -14,12 +17,9 @@ from utils.logger import logger
 from config import GROQ_API_KEY, VLM_MODEL, VLM_MAX_TOKENS
 
 
-# Punctuation that marks a safe sentence boundary to speak on
+# Only yield on true sentence boundaries — never on commas or semicolons.
+# Comma splits produce tiny fragments that gTTS renders unnaturally.
 _SENTENCE_ENDS = frozenset({".", "!", "?", "\n"})
-# Speak on commas/semicolons only after enough chars have accumulated,
-# so we don't emit tiny fragments
-_CLAUSE_ENDS   = frozenset({",", ";"})
-_CLAUSE_MIN_LEN = 40   # minimum buffer length before splitting on a clause end
 
 
 class VLMClient:
@@ -70,16 +70,16 @@ class VLMClient:
         """
         Generator — yields complete sentences as tokens arrive from the VLM.
 
-        The caller iterates and can speak each yielded sentence immediately,
-        so the user hears the first sentence while the VLM is still generating
-        the rest. This is the primary path for scene and reading modules.
+        Splits ONLY on true sentence-end punctuation (.!?\\n).
+        Never splits on commas or semicolons — those produce fragments that
+        gTTS renders with an unnatural hanging pause.
 
-        Example:
-            for sentence in vlm.describe_stream(frame, prompt):
-                speaker.speak(sentence)
+        Remainder handling: if the stream ends without a terminal punctuation
+        mark, a period is appended before yielding so gTTS generates a clean,
+        fully-voiced phrase rather than cutting off the last phoneme.
 
         Yields:
-            str — one spoken sentence / clause at a time, stripped of whitespace.
+            str — one complete sentence at a time, stripped of whitespace.
             On error, yields a single error message string and returns.
         """
         logger.debug(f"Calling Groq Vision streaming ({self.model})...")
@@ -119,14 +119,12 @@ class VLMClient:
 
             buffer += delta
 
-            # Drain all complete sentences from the front of the buffer
+            # Drain all complete sentences from the front of the buffer.
+            # Only sentence-end punctuation triggers a yield — no comma splits.
             while True:
                 idx = -1
                 for i, ch in enumerate(buffer):
                     if ch in _SENTENCE_ENDS:
-                        idx = i
-                        break
-                    if ch in _CLAUSE_ENDS and i >= _CLAUSE_MIN_LEN:
                         idx = i
                         break
 
@@ -137,13 +135,17 @@ class VLMClient:
                 buffer   = buffer[idx + 1:].lstrip()
 
                 if sentence:
-                    logger.debug(f"VLM stream yielding: '{sentence[:60]}'")
+                    logger.debug(f"VLM stream yielding: '{sentence[:80]}'")
                     yield sentence
 
-        # Flush any remaining text that didn't end with punctuation
+        # Flush any remaining text that did not end with punctuation.
+        # Append "." so gTTS voices the last phoneme cleanly instead of
+        # cutting off mid-word.
         remainder = buffer.strip()
         if remainder:
-            logger.debug(f"VLM stream flush: '{remainder[:60]}'")
+            if remainder[-1] not in _SENTENCE_ENDS:
+                remainder += "."
+            logger.debug(f"VLM stream flush: '{remainder[:80]}'")
             yield remainder
 
         total = time.time() - start

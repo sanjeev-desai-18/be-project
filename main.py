@@ -123,10 +123,14 @@ def display_loop():
     import cv2
     import numpy as np
     from modules.currency.currency_detector import get_latest_frame
+    from modules.scene.scene_module import get_latest_scene_frame
 
     window_open = False
 
-    # Blank "waiting" frame shown when detection is not running
+    # Track which scene frame we last showed so we only re-render on change
+    _last_scene_id: list = [None]
+
+    # Blank "waiting" frame shown when nothing is running
     waiting = np.zeros((540, 960, 3), dtype=np.uint8)
     cv2.putText(waiting, "Waiting for currency detection...",
                 (160, 270), cv2.FONT_HERSHEY_SIMPLEX,
@@ -140,23 +144,48 @@ def display_loop():
     logger.info("Display loop started on main thread")
 
     while True:
-        frame = get_latest_frame()
+        currency_frame = get_latest_frame()
+        scene_frame    = get_latest_scene_frame()
 
-        if frame is not None:
-            # Live detection frame
+        if currency_frame is not None:
+            # Live currency detection — always takes priority
             if not window_open:
                 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
                 cv2.resizeWindow(WINDOW_NAME, 960, 540)
                 window_open = True
                 logger.info("Display: window opened")
-            cv2.imshow(WINDOW_NAME, frame)
+            cv2.imshow(WINDOW_NAME, currency_frame)
+
+        elif scene_frame is not None:
+            # Show the latest captured scene frame with a label overlay
+            scene_id = id(scene_frame)
+            if not window_open:
+                cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(WINDOW_NAME, 960, 540)
+                window_open = True
+                logger.info("Display: window opened for scene frame")
+
+            if scene_id != _last_scene_id[0]:
+                # New frame arrived — render label overlay once
+                display = cv2.resize(scene_frame, (960, 540))
+
+                # Semi-transparent dark bar at the top for the label
+                overlay = display.copy()
+                cv2.rectangle(overlay, (0, 0), (960, 44), (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.55, display, 0.45, 0, display)
+
+                cv2.putText(display, "Scene captured",
+                            (14, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.85, (255, 255, 255), 2, cv2.LINE_AA)
+
+                cv2.imshow(WINDOW_NAME, display)
+                _last_scene_id[0] = scene_id
 
         elif window_open:
-            # Detection just stopped — show stopped frame
+            # Something was running but has now stopped
             cv2.imshow(WINDOW_NAME, stopped)
 
         # waitKey must be called continuously to keep Qt event loop alive
-        # even when no window is open yet
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q') and window_open:
             logger.info("'q' pressed — stopping currency detection")

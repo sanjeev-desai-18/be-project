@@ -14,7 +14,7 @@ from config import AGENT_MODEL, AGENT_TEMPERATURE, GROQ_API_KEY
 from utils.logger import logger
 
 
-# ── Groq LLM ─────────────────────────────────────────
+# ── Groq LLM ──────────────────────────────────────────────────────────────────
 llm = ChatGroq(
     model=AGENT_MODEL,
     temperature=AGENT_TEMPERATURE,
@@ -22,7 +22,12 @@ llm = ChatGroq(
 )
 
 
-# ── Routing Prompt ────────────────────────────────────
+# ── Routing Prompt ─────────────────────────────────────────────────────────────
+# Key additions vs previous version:
+#   • Explicit instruction to be sceptical of short/ambiguous/noisy transcripts.
+#   • Confidence guidance — only assign high confidence when the command is clear
+#     and unambiguous; assign low confidence for anything unclear or too short.
+#   • "unknown" is now an explicitly preferred fallback, not a last resort.
 ROUTING_PROMPT = """
 You are the routing brain of a voice assistant for visually impaired users in India.
 
@@ -45,6 +50,18 @@ Hints:
 - news, weather, time, who is, what is, information, update → knowledge_mode
 - thank you, thanks, shukriya, dhanyawad, great, awesome, helpful → greeting_mode
 
+CONFIDENCE RULES — follow these strictly:
+- Assign confidence 0.85–1.0 ONLY when the transcript clearly and unambiguously
+  matches a mode keyword above.
+- Assign confidence 0.50–0.75 when the transcript is related but not a direct keyword.
+- Assign confidence below 0.50 (and mode "unknown") when:
+    • The transcript is fewer than 2 words.
+    • The transcript sounds like noise, a filler word, or is hard to parse.
+    • You are not sure what the user wants.
+    • The transcript does not resemble any command above.
+- When in doubt, always prefer "unknown" with low confidence over a wrong mode
+  with false high confidence. It is always safer to ask than to act on noise.
+
 IMPORTANT: Return ONLY a raw JSON object. No markdown. No code fences. No explanation.
 Example: {{"mode": "navigation_mode", "confidence": 0.92, "cleaned_text": "describe surroundings", "extra_context": ""}}
 """
@@ -59,8 +76,18 @@ VALID_MODES = {
     "unknown"
 }
 
+# Modes that trigger hardware (camera, etc.) — held to a stricter confidence bar.
+_ACTION_MODES = {"navigation_mode", "reading_mode", "currency_mode"}
 
-# ── Safe JSON extractor ───────────────────────────────
+# Minimum confidence required to execute an action mode.
+# Anything below this is downgraded to unknown before it reaches the router.
+_ACTION_MIN_CONFIDENCE = 0.70
+
+# Minimum number of words a transcript must have before we bother routing it.
+_MIN_TRANSCRIPT_WORDS = 2
+
+
+# ── Safe JSON extractor ────────────────────────────────────────────────────────
 def _parse_llm_json(raw: str) -> dict:
     text = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
     match = re.search(r"\{.*?\}", text, re.DOTALL)
@@ -120,6 +147,19 @@ def interpret_intent_node(state: AssistantState) -> AssistantState:
         logger.warning("Empty transcript — skipping LLM call")
         return fallback
 
+    # ── Pre-LLM noise gate ────────────────────────────────────────────────────
+    # Transcripts shorter than _MIN_TRANSCRIPT_WORDS almost certainly came from
+    # noise or a single accidental word. Skip the LLM entirely and treat as
+    # unknown — the user will hear a clarification question instead of a
+    # random module firing.
+    word_count = len(transcript.strip().split())
+    if word_count < _MIN_TRANSCRIPT_WORDS:
+        logger.warning(
+            f"Transcript '{transcript}' is only {word_count} word(s) — "
+            "too short to route, treating as unknown"
+        )
+        return fallback
+
     prompt = ROUTING_PROMPT.format(transcript=transcript)
 
     try:
@@ -137,6 +177,18 @@ def interpret_intent_node(state: AssistantState) -> AssistantState:
         if mode not in VALID_MODES:
             logger.warning(f"Unexpected mode '{mode}' — falling back to unknown")
             mode = "unknown"
+
+        # ── Post-LLM action confidence gate ──────────────────────────────────
+        # Action modes touch hardware. If the LLM returned one but with
+        # confidence below the minimum, silently downgrade to unknown so the
+        # user is asked to confirm rather than the wrong module firing.
+        if mode in _ACTION_MODES and confidence < _ACTION_MIN_CONFIDENCE:
+            logger.warning(
+                f"Action mode '{mode}' confidence {confidence:.2f} is below "
+                f"minimum {_ACTION_MIN_CONFIDENCE} — downgrading to unknown"
+            )
+            mode       = "unknown"
+            confidence = 0.0
 
         logger.info(f"Agent → mode: {mode} | confidence: {confidence:.2f}")
 
@@ -200,20 +252,15 @@ def scene_node(state: AssistantState) -> AssistantState:
     _stop_currency_if_running()
 
     sp = Speaker()
-
-    # Immediate ACK — user hears this within ~200ms of routing completing,
-    # while the camera is still warming up and the VLM hasn't been called yet.
     sp.speak("Looking at your surroundings.")
 
     try:
-        # speaker=sp causes each sentence to be spoken as it streams.
         result = SceneModule().run(speaker=sp)
     except Exception as e:
         logger.error(f"Scene module error: {e}", exc_info=True)
         result = "I was unable to analyse the scene."
         sp.speak_stream(result)
 
-    # spoken=True tells tts_node to skip — audio already played sentence by sentence.
     return {**state, "final_output": result, "spoken": True}
 
 
@@ -228,19 +275,15 @@ def reading_node(state: AssistantState) -> AssistantState:
     _stop_currency_if_running()
 
     sp = Speaker()
-
-    # Immediate ACK
     sp.speak("Reading now.")
 
     try:
-        # speaker=sp causes each sentence to be spoken as it streams.
         result = ReadingModule().run(speaker=sp)
     except Exception as e:
         logger.error(f"Reading module error: {e}", exc_info=True)
         result = "I could not read the text."
         sp.speak_stream(result)
 
-    # spoken=True — tts_node will skip re-speaking.
     return {**state, "final_output": result, "spoken": True}
 
 
@@ -322,7 +365,6 @@ def greeting_node(state: AssistantState) -> AssistantState:
 def tts_node(state: AssistantState) -> AssistantState:
     from tts.speaker import Speaker
 
-    # Skip if the module already spoke (scene_node / reading_node stream directly)
     if state.get("spoken"):
         logger.debug("tts_node: spoken=True — skipping (audio already played)")
         return state
