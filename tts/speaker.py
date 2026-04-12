@@ -37,7 +37,7 @@ _pygame_ready = False
 if TTS_ENGINE in ("gtts", "elevenlabs"):
     try:
         import pygame
-        pygame.mixer.init(frequency=22050, size=-16, channels=1, buffer=1024)
+        pygame.mixer.init(frequency=22050, size=-16, channels=1, buffer=4096)
         _pygame_ready = True
         logger.info("pygame.mixer initialised for audio playback ✓")
     except Exception as e:
@@ -122,6 +122,11 @@ def _speak_gtts(text: str):
             pygame.mixer.music.play()
             while pygame.mixer.music.get_busy():
                 pygame.time.Clock().tick(10)
+            # ALSA hardware ring-buffer drain: get_busy() returns False while
+            # the OS audio subsystem still holds the last ~200-400ms of samples.
+            # Without this wait, the next music.load() flushes that buffer and
+            # cuts off the final syllable of the sentence.
+            pygame.time.wait(300)
         else:
             # Fallback: write to temp file and use aplay
             import tempfile
@@ -180,6 +185,7 @@ def _speak_elevenlabs(text: str):
             pygame.mixer.music.play()
             while pygame.mixer.music.get_busy():
                 pygame.time.Clock().tick(10)
+            pygame.time.wait(300)
         else:
             logger.error("ElevenLabs: pygame not available")
             _speak_gtts(text)
@@ -310,6 +316,8 @@ class _TTSWorker:
                 pygame.mixer.music.play()
                 while pygame.mixer.music.get_busy():
                     pygame.time.Clock().tick(10)
+                # Drain ALSA hardware buffer — prevents final syllable cut-off.
+                pygame.time.wait(300)
             except Exception as e:
                 logger.error(f"Prefetch playback failed: {e}")
 

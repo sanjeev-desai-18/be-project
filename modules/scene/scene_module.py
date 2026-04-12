@@ -1,28 +1,20 @@
 # modules/scene/scene_module.py
 #
-# Changes from previous version:
+# Speech strategy — ONE gTTS call, ONE MP3, zero inter-sentence gaps:
 #
-#   RESOLUTION (camera_manager.py was the real fix):
-#     camera_manager now uses create_still_configuration((2304, 1296)) for
-#     scene mode, selecting the sensor's native 2304x1296 mode. The previous
-#     hardcoded (1024, 768) preview config was the reason frames were 1024x768
-#     regardless of what resize_frame was asked to do here.
+#   Every previous attempt that split the response across multiple speak()
+#   or speak_stream() calls produced an audible pause at the split point
+#   because each call is a separate MP3 file. gTTS encodes a small silence
+#   tail into every file, and pygame's music.load() adds a brief buffer
+#   flush on top — together ~300-500ms of dead air per boundary.
 #
-#   SPEECH — full collection, single gTTS call:
-#     The remaining inter-sentence pause came from two separate speak_stream()
-#     calls (first sentence + tail), which produced two MP3 files with an
-#     audible gap at the boundary.
-#
-#     The agent.py scene_node already says "Looking at your surroundings."
-#     the instant routing completes (~200ms), so perceived latency is handled.
-#     We can afford to collect the full VLM response (2-3 short sentences,
-#     arrives in ~2-3s) and send it as one string to speaker.speak() — one
-#     MP3, zero inter-sentence gaps, completely natural playback.
-#
-#   DISPLAY:
-#     Raw frame stored to _latest_scene_frame immediately after capture so
-#     it appears on screen while the VLM is still generating.
+#   Fix: collect the complete VLM response (2-3 short sentences, ~3s),
+#   join into one string, synthesise ONCE. The ACK "Looking at your
+#   surroundings." already plays at ~200ms from agent.py so the user
+#   hears immediate feedback. The full description then plays as one
+#   uninterrupted audio clip with natural prosody end-to-end.
 
+import io
 import threading
 import time as _time
 
@@ -40,7 +32,6 @@ _latest_scene_frame: np.ndarray | None = None
 
 
 def get_latest_scene_frame() -> np.ndarray | None:
-    """Return the most recently captured scene frame (BGR), or None."""
     with _frame_lock:
         return _latest_scene_frame
 
@@ -48,8 +39,6 @@ def get_latest_scene_frame() -> np.ndarray | None:
 def _store_scene_frame(bgr: np.ndarray) -> None:
     global _latest_scene_frame
     with _frame_lock:
-        # Keep a 1280-wide copy for display — avoids holding a 2304x1296
-        # array in RAM for the lifetime of the program.
         _latest_scene_frame = resize_frame(bgr.copy(), max_width=1280)
 
 
@@ -62,9 +51,7 @@ Be direct and conversational. Do not use lists, bullet points, or headings.
 Start immediately with the description — no preamble like "In this image..."
 """
 
-# How long to wait for the VLM to finish collecting all sentences.
-# 2-3 sentences normally arrive within 3s; 10s is a safe ceiling.
-_COLLECT_TIMEOUT = 10.0
+_VLM_TIMEOUT = 10.0
 
 
 class SceneModule:
@@ -73,14 +60,9 @@ class SceneModule:
         self.vlm = VLMClient()
 
     def _capture_frame(self) -> tuple[str, np.ndarray] | tuple[None, None]:
-        """
-        Capture one frame at full native resolution (2304x1296).
-        Stores a display copy, returns base64 string for VLM.
-        """
         picam2 = camera_manager.acquire(mode="scene", warmup=0.3)
         try:
             raw = picam2.capture_array("main")
-            # No resize for VLM — send at full 2304x1296 native resolution.
             b64 = frame_to_base64(raw, quality=85)
             logger.debug(
                 f"Scene frame captured at {raw.shape[1]}x{raw.shape[0]} "
@@ -96,16 +78,10 @@ class SceneModule:
 
     def run(self, speaker=None) -> str:
         """
-        Capture at full resolution, collect the complete VLM response,
-        then speak it as a single TTS call — one MP3, no gaps, natural audio.
+        Capture frame, collect full VLM response, speak as a single TTS call.
 
-        The agent already plays "Looking at your surroundings." before calling
-        run(), so the user hears feedback within ~200ms. This function then
-        collects and plays the full description (~2-3s later) as one seamless
-        audio clip.
-
-        Returns:
-            Full description text for logging / state.
+        One gTTS call = one MP3 = no pauses mid-description.
+        The ACK from agent.py covers perceived latency.
         """
         logger.info("SceneModule.run() | capturing frame via camera_manager")
 
@@ -117,24 +93,24 @@ class SceneModule:
                 speaker.speak(msg)
             return msg
 
-        # ── Collect full VLM response in background thread ────────────────
+        # ── Collect full VLM response ─────────────────────────────────────
         collected: list[str] = []
-        error_box: list[Exception] = []
+        error_box: list[str] = []
 
         def _generate():
             try:
                 for sentence in self.vlm.describe_stream(b64_frame, _SCENE_PROMPT):
                     collected.append(sentence)
             except Exception as exc:
-                error_box.append(exc)
-                logger.error(f"VLM streaming error in SceneModule: {exc}")
+                error_box.append(str(exc))
+                logger.error(f"VLM error in SceneModule: {exc}")
 
         gen = threading.Thread(target=_generate, daemon=True, name="scene-vlm-gen")
         gen.start()
-        gen.join(timeout=_COLLECT_TIMEOUT)
+        gen.join(timeout=_VLM_TIMEOUT)
 
         if gen.is_alive():
-            logger.warning("VLM did not finish within timeout — using partial response")
+            logger.warning("VLM timed out — using partial response")
 
         full_text = " ".join(s.strip() for s in collected if s.strip())
 
@@ -144,9 +120,11 @@ class SceneModule:
                 speaker.speak(msg)
             return msg
 
-        logger.info(f"Scene complete — {len(collected)} sentences, {len(full_text)} chars")
+        logger.info(
+            f"Scene complete — {len(collected)} chunk(s), {len(full_text)} chars"
+        )
 
-        # Single speak() call — one MP3, zero inter-sentence gaps.
+        # ── Single gTTS call — one MP3, no gaps, no cut-off words ─────────
         if speaker:
             speaker.speak(full_text)
 
