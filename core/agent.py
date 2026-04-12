@@ -48,7 +48,6 @@ Hints:
 - read, padho, kya likha hai → reading_mode
 - surroundings, aas paas, bata kya hai, describe, surrounding → navigation_mode
 - news, weather, time, who is, what is, information, update → knowledge_mode
-- thank you, thanks, shukriya, dhanyawad, great, awesome, helpful → greeting_mode
 
 CONFIDENCE RULES — follow these strictly:
 - Assign confidence 0.85–1.0 ONLY when the transcript clearly and unambiguously
@@ -72,7 +71,6 @@ VALID_MODES = {
     "currency_mode",
     "stop_mode",
     "knowledge_mode",
-    "greeting_mode",
     "unknown"
 }
 
@@ -211,16 +209,8 @@ def interpret_intent_node(state: AssistantState) -> AssistantState:
 # NODE 2 — Confidence Router
 # ═══════════════════════════════════════════════
 def confidence_router_node(state: AssistantState) -> AssistantState:
-    zone = get_confidence_zone(state["confidence"])
-
-    if zone == "low" or state["mode"] == "unknown":
-        question = build_clarification_question(state["mode"])
-        return {**state, "needs_clarification": True, "final_output": question}
-    elif zone == "medium":
-        prefix = build_medium_prefix(state["mode"])
-        return {**state, "final_output": prefix}
-    else:
-        return {**state, "final_output": ""}
+    # Never ask clarification questions — execute directly or stay silent.
+    return {**state, "final_output": ""}
 
 
 # ═══════════════════════════════════════════════
@@ -236,7 +226,6 @@ def route_to_module(state: AssistantState) -> str:
         "currency_mode":   "currency_node",
         "stop_mode":       "stop_node",
         "knowledge_mode":  "knowledge_node",
-        "greeting_mode":   "greeting_node",
     }
     return routes.get(state.get("mode", "unknown"), "tts_node")
 
@@ -252,7 +241,7 @@ def scene_node(state: AssistantState) -> AssistantState:
     _stop_currency_if_running()
 
     sp = Speaker()
-    sp.speak("Looking at your surroundings.")
+    sp.speak_stream("Looking at your surroundings.")
 
     try:
         result = SceneModule().run(speaker=sp)
@@ -275,7 +264,7 @@ def reading_node(state: AssistantState) -> AssistantState:
     _stop_currency_if_running()
 
     sp = Speaker()
-    sp.speak("Reading now.")
+    sp.speak_stream("Reading now.")
 
     try:
         result = ReadingModule().run(speaker=sp)
@@ -349,17 +338,6 @@ def knowledge_node(state: AssistantState) -> AssistantState:
 
 
 # ═══════════════════════════════════════════════
-# NODE 3f — Greeting
-# ═══════════════════════════════════════════════
-def greeting_node(state: AssistantState) -> AssistantState:
-    logger.info("Executing Greeting node")
-    return {
-        **state,
-        "final_output": "I hope everything is alright! How can I help you more?"
-    }
-
-
-# ═══════════════════════════════════════════════
 # NODE 4 — TTS
 # ═══════════════════════════════════════════════
 def tts_node(state: AssistantState) -> AssistantState:
@@ -388,7 +366,6 @@ def build_agent():
     graph.add_node("currency_node",     currency_node)
     graph.add_node("stop_node",         stop_node)
     graph.add_node("knowledge_node",    knowledge_node)
-    graph.add_node("greeting_node",     greeting_node)
     graph.add_node("tts_node",          tts_node)
 
     graph.set_entry_point("interpret_intent")
@@ -403,7 +380,6 @@ def build_agent():
             "currency_node":  "currency_node",
             "stop_node":      "stop_node",
             "knowledge_node": "knowledge_node",
-            "greeting_node":  "greeting_node",
             "tts_node":       "tts_node",
         }
     )
@@ -413,7 +389,6 @@ def build_agent():
     graph.add_edge("currency_node",  "tts_node")
     graph.add_edge("stop_node",      "tts_node")
     graph.add_edge("knowledge_node", "tts_node")
-    graph.add_edge("greeting_node",  "tts_node")
     graph.add_edge("tts_node", END)
 
     return graph.compile()

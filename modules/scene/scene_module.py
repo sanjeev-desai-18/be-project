@@ -90,7 +90,7 @@ class SceneModule:
         if b64_frame is None:
             msg = "I could not access the camera."
             if speaker:
-                speaker.speak(msg)
+                speaker.speak_stream(msg)
             return msg
 
         # ── Collect full VLM response ─────────────────────────────────────
@@ -117,7 +117,7 @@ class SceneModule:
         if not full_text:
             msg = "I can see the scene but could not make out anything clearly."
             if speaker:
-                speaker.speak(msg)
+                speaker.speak_stream(msg)
             return msg
 
         logger.info(
@@ -126,6 +126,6 @@ class SceneModule:
 
         # ── Single gTTS call — one MP3, no gaps, no cut-off words ─────────
         if speaker:
-            speaker.speak(full_text)
+            speaker.speak_stream(full_text)
 
         return full_text

@@ -36,9 +36,33 @@ CAMERA_WARMUP_MS    = 500
 #                  Install: pip install pyttsx3 && sudo apt install espeak-ng
 #   "gtts"       — Google TTS, online, saves to disk first (~1-3s extra)
 #   "elevenlabs" — highest quality, requires API key
-TTS_ENGINE          = "gtts"
+# Options:
+#   "piper"      — RECOMMENDED. Offline neural TTS, <200ms latency, natural voice.
+#                  pip install piper-tts
+#                  Download voice: en_US-lessac-medium.onnx + .onnx.json
+#                  https://github.com/rhasspy/piper/blob/master/VOICES.md
+#   "gtts"       — Google Translate TTS, online, ~1-2s network delay per call
+#   "pyttsx3"    — espeak-ng, offline, robotic
+#   "elevenlabs" — highest quality, requires API key
+TTS_ENGINE          = "gtts"     # "gtts" now uses edge-tts (Microsoft neural) under the hood
 TTS_LANGUAGE        = "en"
 TTS_SLOW            = False
+
+# edge-tts settings (used when TTS_ENGINE = "gtts" — edge-tts replaces gTTS)
+# Voice options (natural, free, no API key):
+#   "en-US-JennyNeural"   — warm, clear American female (recommended)
+#   "en-US-GuyNeural"     — natural American male
+#   "en-GB-SoniaNeural"   — British female
+#   "en-IN-NeerjaNeural"  — Indian English female
+# Rate: "+0%" normal, "+10%" faster, "-10%" slower
+EDGE_TTS_VOICE      = "en-US-JennyNeural"
+EDGE_TTS_RATE       = "+0%"
+
+# Piper settings (only used when TTS_ENGINE = "piper")
+# Path to the .onnx model file. Download from:
+# https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_US/lessac/medium
+PIPER_MODEL         = "/home/pi/piper-voices/en_US-lessac-medium.onnx"
+PIPER_LENGTH_SCALE  = 1.15       # slightly slower — more natural cadence        # speech speed: >1.0 = slower, <1.0 = faster
 
 # pyttsx3 settings (only used when TTS_ENGINE = "pyttsx3")
 PYTTSX3_RATE        = 165        # words per minute — lower = slower/clearer
@@ -51,5 +75,3 @@ HAILO_HEF_PATH      = os.path.join(
 )
 CURRENCY_CONFIDENCE = 0.8
 CURRENCY_MAX_FPS    = 30
-
-
