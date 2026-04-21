@@ -79,7 +79,9 @@ _ACTION_MODES = {"navigation_mode", "reading_mode", "currency_mode"}
 
 # Minimum confidence required to execute an action mode.
 # Anything below this is downgraded to unknown before it reaches the router.
-_ACTION_MIN_CONFIDENCE = 0.70
+_ACTION_MIN_CONFIDENCE  = 0.75
+_READING_MIN_CONFIDENCE = 0.85   # reading needs higher bar — most noise-triggered mode
+_READING_MIN_WORDS      = 3      # "read" alone is not enough to trigger camera
 
 # Minimum number of words a transcript must have before we bother routing it.
 _MIN_TRANSCRIPT_WORDS = 2
@@ -158,6 +160,17 @@ def interpret_intent_node(state: AssistantState) -> AssistantState:
         )
         return fallback
 
+    # Reading mode extra gate: require >= 3 words before even calling LLM.
+    # Catches noise like "read" or "please read" that LLM routes confidently.
+    lower = transcript.lower().strip()
+    looks_like_read = any(w in lower.split() for w in ("read", "padho", "reading"))
+    if looks_like_read and word_count < _READING_MIN_WORDS:
+        logger.warning(
+            f"Transcript '{transcript}' looks like a read command but only "
+            f"{word_count} word(s) — discarding as noise"
+        )
+        return fallback
+
     prompt = ROUTING_PROMPT.format(transcript=transcript)
 
     try:
@@ -180,10 +193,11 @@ def interpret_intent_node(state: AssistantState) -> AssistantState:
         # Action modes touch hardware. If the LLM returned one but with
         # confidence below the minimum, silently downgrade to unknown so the
         # user is asked to confirm rather than the wrong module firing.
-        if mode in _ACTION_MODES and confidence < _ACTION_MIN_CONFIDENCE:
+        min_conf = _READING_MIN_CONFIDENCE if mode == "reading_mode" else _ACTION_MIN_CONFIDENCE
+        if mode in _ACTION_MODES and confidence < min_conf:
             logger.warning(
                 f"Action mode '{mode}' confidence {confidence:.2f} is below "
-                f"minimum {_ACTION_MIN_CONFIDENCE} — downgrading to unknown"
+                f"minimum {min_conf} — downgrading to unknown"
             )
             mode       = "unknown"
             confidence = 0.0

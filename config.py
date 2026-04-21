@@ -56,12 +56,12 @@ TTS_SLOW            = False
 #   "en-IN-NeerjaNeural"  — Indian English female
 # Rate: "+0%" normal, "+10%" faster, "-10%" slower
 EDGE_TTS_VOICE      = "en-US-JennyNeural"
-EDGE_TTS_RATE       = "+0%"
+EDGE_TTS_RATE       = "-10%"
 
 # Piper settings (only used when TTS_ENGINE = "piper")
 # Path to the .onnx model file. Download from:
 # https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_US/lessac/medium
-PIPER_MODEL         = "/home/pi/piper-voices/en_US-lessac-medium.onnx"
+PIPER_MODEL         = "/home/linux/piper-voices/en_US-lessac-medium.onnx"
 PIPER_LENGTH_SCALE  = 1.15       # slightly slower — more natural cadence        # speech speed: >1.0 = slower, <1.0 = faster
 
 # pyttsx3 settings (only used when TTS_ENGINE = "pyttsx3")

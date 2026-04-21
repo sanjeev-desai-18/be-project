@@ -196,7 +196,7 @@ def listen() -> str:
 
     # Raised from 0.5s to 1.0s: real commands are rarely shorter than 1s;
     # brief noise bursts that pass the volume threshold usually are.
-    if len(full_audio) < SAMPLE_RATE * 1.0:
+    if len(full_audio) < SAMPLE_RATE * 1.5:
         logger.warning("Recording too short — skipping (likely noise)")
         return ""
 
@@ -308,9 +308,9 @@ def _transcribe_numpy(audio: np.ndarray, source_rate: int) -> str:
                     )
                     return ""
 
-                if avg_logprob < -1.0:
+                if avg_logprob < -0.8:
                     logger.warning(
-                        f"Low confidence avg_logprob ({avg_logprob:.2f}) — "
+                        f"Low confidence avg_logprob ({avg_logprob:.2f}, threshold -0.8) — "
                         "discarding as noise"
                     )
                     return ""
