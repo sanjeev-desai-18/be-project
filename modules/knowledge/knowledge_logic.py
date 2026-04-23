@@ -1,137 +1,195 @@
 # modules/knowledge/knowledge_logic.py
+# ─────────────────────────────────────────────────────────────────────────────
+# Ported from final-year-project reference into be-project-main.
+# Changes vs original be-project knowledge_logic.py:
+#   1. Uses dedicated KNOWLEDGE_MODEL (llama-3.3-70b-versatile) instead of
+#      AGENT_MODEL — much stronger for factual Q&A.
+#   2. Conversation history (last 3 exchanges = 6 messages) for follow-up support.
+#   3. TIME / DATE queries answered instantly from system clock (no LLM call).
+#   4. Weather response now includes a weather description (not just temperature).
+#   5. LLM prompt uses SystemMessage + history + HumanMessage (multi-turn context).
+#   6. Parallel execution: language detection + weather + web search run together.
+#   7. Web search result capped at 1500 chars to avoid huge prompts.
+#   8. Empty / punctuation-only query guard at the top.
+#   9. Broader multilingual keyword lists.
+#  10. handle_knowledge_query() now returns str — fully backward-compatible since
+#      BE's agent.py knowledge_node ignores the return value anyway.
+# ─────────────────────────────────────────────────────────────────────────────
 
 from utils.logger import logger
 from tts.speaker import Speaker
 from modules.knowledge.knowledge_tool import search_web
 from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage
-from config import AGENT_MODEL, GROQ_API_KEY
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from config import GROQ_API_KEY
 from langdetect import detect
 import datetime
 import requests
+import concurrent.futures
 
-llm = ChatGroq(
-    model=AGENT_MODEL,
-    api_key=GROQ_API_KEY,
-    temperature=0.2
-)
+# ── Dedicated model for knowledge (stronger than the routing agent model) ──────
+KNOWLEDGE_MODEL = "llama-3.3-70b-versatile"
 
-# ─────────────────────────────────────────────
-# Keywords — skip web search for these
-# ─────────────────────────────────────────────
-TIME_KEYWORDS    = ["time", "समय", "वेळ", "बजे"]
-DATE_KEYWORDS    = ["date", "day", "today", "तारीख", "दिनांक", "आज"]
-WEATHER_KEYWORDS = ["weather", "temperature", "temp", "मौसम", "हवामान"]
+llm = ChatGroq(model=KNOWLEDGE_MODEL, api_key=GROQ_API_KEY, temperature=0.3)
 
-def _needs_web_search(query: str) -> bool:
-    q = query.lower()
-    local_keywords = TIME_KEYWORDS + DATE_KEYWORDS + WEATHER_KEYWORDS
-    return not any(k in q for k in local_keywords)
+# ── Conversation history (last 3 exchanges = 6 messages) ─────────────────────
+_history: list = []
 
-def _needs_weather(query: str) -> bool:
-    q = query.lower()
-    return any(k in q for k in WEATHER_KEYWORDS)
+def _add_to_history(role: str, content: str):
+    _history.append({"role": role, "content": content})
+    if len(_history) > 6:
+        _history.pop(0)
 
 
-# ─────────────────────────────────────────────
-# Language Detection
-# ─────────────────────────────────────────────
-def _detect_language(query: str) -> str:
+# ── Keyword lists (broader than original — includes Hindi/Marathi/Roman Hindi) ─
+_TIME_KW    = ["time", "समय", "वेळ", "बजे", "kitne baje", "what time"]
+_DATE_KW    = ["date", "day", "today", "तारीख", "दिनांक", "आज", "what day"]
+_WEATHER_KW = [
+    "weather", "temperature", "temp", "मौसम", "हवामान",
+    "garmi", "thand", "rain", "hot", "cold"
+]
+
+def _is_local_query(q: str) -> bool:
+    """Time/date queries — answer from system clock, no LLM or web needed."""
+    return any(k in q for k in _TIME_KW + _DATE_KW)
+
+def _needs_weather(q: str) -> bool:
+    return any(k in q for k in _WEATHER_KW)
+
+def _needs_web(q: str) -> bool:
+    """Always search web EXCEPT for pure time/date questions."""
+    return not _is_local_query(q)
+
+
+# ── Local data fetchers ────────────────────────────────────────────────────────
+def _get_time() -> str:
+    return datetime.datetime.now().strftime("%I:%M %p")
+
+def _get_date() -> str:
+    return datetime.datetime.now().strftime("%A, %d %B %Y")
+
+def _get_weather() -> str:
+    """Returns temperature + human-readable weather description for Dombivli."""
     try:
-        code = detect(query)
-        logger.info(f"Detected language code: {code}")
-        return code
+        url = (
+            "https://api.open-meteo.com/v1/forecast"
+            "?latitude=19.2183&longitude=73.0868&current_weather=true"
+        )
+        data = requests.get(url, timeout=4).json()
+        temp = data["current_weather"]["temperature"]
+        code = data["current_weather"]["weathercode"]
+        desc = {
+            0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
+            45: "foggy", 51: "light drizzle", 61: "light rain", 63: "moderate rain",
+            65: "heavy rain", 80: "rain showers", 95: "thunderstorm"
+        }.get(code, "")
+        return f"{temp}°C{', ' + desc if desc else ''}"
+    except Exception as e:
+        logger.error(f"Weather fetch failed: {e}")
+        return ""
+
+def _detect_lang(query: str) -> str:
+    try:
+        return detect(query)
     except Exception:
         return "en"
 
 
-# ─────────────────────────────────────────────
-# Local Data Fetchers
-# ─────────────────────────────────────────────
-def _get_current_time() -> str:
-    return datetime.datetime.now().strftime("%I:%M %p")
+# ── LLM call with multi-turn history ──────────────────────────────────────────
+def _ask_llm(query: str, lang: str, web: str = "", weather: str = "") -> str:
+    now_time   = _get_time()
+    today_date = _get_date()
 
-def _get_current_date() -> str:
-    return datetime.datetime.now().strftime("%A, %d %B %Y")
+    live = f"- Time: {now_time}\n- Date: {today_date}"
+    if weather:
+        live += f"\n- Weather (Dombivli): {weather}"
 
-def _get_weather() -> str:
-    try:
-        url = "https://api.open-meteo.com/v1/forecast?latitude=19.2183&longitude=73.0868&current_weather=true"
-        data = requests.get(url, timeout=5).json()
-        temp = data["current_weather"]["temperature"]
-        return f"{temp} degrees Celsius"
-    except Exception as e:
-        logger.error(f"Weather API error: {e}")
-        return "unavailable"
+    web_section = f"\nLatest web results:\n{web}" if web else ""
 
-
-# ─────────────────────────────────────────────
-# LLM Call
-# ─────────────────────────────────────────────
-def _ask_llm(query: str, lang_code: str, web_context: str = "", weather: str = "") -> str:
-    now_time   = _get_current_time()
-    today_date = _get_current_date()
-
-    context_section = (
-        f"Additional web context: {web_context}"
-        if web_context else
-        "No web context available — use your own knowledge."
-    )
-
-    weather_section = (
-        f"- Current temperature (Dombivli): {weather}"
-        if weather else ""
-    )
-
-    prompt = f"""You are a helpful voice assistant for visually impaired users in India.
-
-LANGUAGE RULE: Reply in language with ISO code '{lang_code}' only.
+    system = f"""You are a helpful voice assistant for a visually impaired person in India.
 
 LIVE DATA:
-- Current time: {now_time}
-- Today's date: {today_date}
-{weather_section}
+{live}
+{web_section}
 
-{context_section}
+RULES:
+- Reply ONLY in language code '{lang}'.
+- Maximum 2 short sentences. This is spoken audio — keep it brief.
+- Answer directly. No preamble like "Sure", "According to", "Of course".
+- Use web results if provided — they have the latest info.
+- If web results are empty, use your own knowledge confidently.
+- Never say "I don't know" or "not specified" — give your best answer.
+- The user speaks via microphone so transcription errors are common. Use \
+conversation history and context to infer the correct meaning \
+(e.g. "Chember" = Chembur, "Wased" = VESIT). Always interpret charitably."""
 
-Rules:
-- Answer in MAXIMUM 2 short, natural sentences.
-- Give the direct answer immediately — no preamble.
-- Speak naturally as if talking to a person out loud.
+    messages = [SystemMessage(content=system)]
+    for m in _history:
+        messages.append(
+            HumanMessage(content=m["content"]) if m["role"] == "user"
+            else AIMessage(content=m["content"])
+        )
+    messages.append(HumanMessage(content=query))
 
-Question: {query}
-"""
-    response = llm.invoke([HumanMessage(content=prompt)])
-    return response.content.strip().replace("\n", " ")
+    return llm.invoke(messages).content.strip().replace("\n", " ")
 
 
-# ─────────────────────────────────────────────
-# Main Handler
-# ─────────────────────────────────────────────
-def handle_knowledge_query(query: str):
+# ── Main handler ───────────────────────────────────────────────────────────────
+def handle_knowledge_query(query: str) -> str:
+    """
+    Handle a knowledge query end-to-end: fetch data, call LLM, speak the answer.
+    Returns the answer string (BE's agent.py ignores the return value, but it's
+    available for future use or testing).
+    """
     try:
-        logger.info(f"Knowledge query: {query}")
+        query = query.strip()
+        if not query or query in [".", ",", "?", "!", ""]:
+            logger.warning("Empty knowledge query — skipping")
+            return ""
 
-        lang_code = _detect_language(query)
-        weather   = _get_weather() if _needs_weather(query) else ""
+        logger.info(f"Knowledge: '{query}'")
+        q = query.lower()
 
-        web_context = ""
-        if _needs_web_search(query):
-            try:
-                web_context = search_web(query)
-                if web_context:
-                    logger.info("Web search succeeded — using as context boost")
-                else:
-                    logger.warning("Web search empty — LLM will use own knowledge")
-            except Exception as e:
-                logger.warning(f"Web search skipped: {e}")
+        # ── Instant time/date replies (no LLM needed) ────────────────────────
+        if any(k in q for k in _TIME_KW) and not _needs_weather(q):
+            answer = f"It is {_get_time()}."
+            Speaker().speak(answer)
+            _add_to_history("user", query)
+            _add_to_history("assistant", answer)
+            return answer
 
-        answer = _ask_llm(query, lang_code, web_context, weather)
+        if any(k in q for k in _DATE_KW) and not _needs_weather(q):
+            answer = f"Today is {_get_date()}."
+            Speaker().speak(answer)
+            _add_to_history("user", query)
+            _add_to_history("assistant", answer)
+            return answer
+
+        # ── Parallel: language detection + weather + web search ───────────────
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            lang_f    = ex.submit(_detect_lang, query)
+            weather_f = ex.submit(_get_weather) if _needs_weather(q) else None
+            web_f     = ex.submit(search_web, query) if _needs_web(q) else None
+
+            lang    = lang_f.result()
+            weather = weather_f.result(timeout=5) if weather_f else ""
+            web     = ""
+            if web_f:
+                try:
+                    web = web_f.result(timeout=7)
+                except Exception as e:
+                    logger.warning(f"Web search timed out: {e}")
+
+        answer = _ask_llm(query, lang, web, weather)
+
+        _add_to_history("user", query)
+        _add_to_history("assistant", answer)
+
+        logger.info(f"Answer: '{answer[:80]}'")
         Speaker().speak(answer)
+        return answer
 
     except Exception as e:
-        logger.error(f"Knowledge logic error: {e}", exc_info=True)
-        try:
-            Speaker().speak("Sorry, I couldn't process that.")
-        except Exception:
-            pass
+        logger.error(f"Knowledge error: {e}", exc_info=True)
+        Speaker().speak("Sorry, I couldn't get that.")
+        return "Sorry, I couldn't get that."

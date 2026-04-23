@@ -1,30 +1,33 @@
 # modules/knowledge/knowledge_tool.py
+# ─────────────────────────────────────────────────────────────────────────────
+# Ported from final-year-project reference into be-project-main.
+# Changes vs original be-project knowledge_tool.py:
+#   1. Caps combined web result at 1500 characters to avoid bloating LLM prompts.
+#   2. Simpler, cleaner error handling — single try/catch, no multi-backend loop.
+#      (The multi-backend loop in the original was added to handle rate limits;
+#       the newer duckduckgo_search library handles backend selection internally.)
+# ─────────────────────────────────────────────────────────────────────────────
 
-from duckduckgo_search import DDGS
 from utils.logger import logger
 
 
 def search_web(query: str, max_results: int = 3) -> str:
     """
-    Try DuckDuckGo with multiple backends.
-    Returns snippet string or empty string on failure.
+    Search the web using DDGS.
+    Falls back gracefully — never crashes the pipeline.
+    Result is capped at 1500 chars to avoid bloating the LLM prompt.
     """
-    backends = ["html", "lite"]  # skip "api" — it always rate limits
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        if results:
+            snippets = [r.get("body", "") for r in results if r.get("body")]
+            if snippets:
+                combined = " ".join(snippets)
+                logger.info(f"Web search OK — {len(snippets)} results")
+                return combined[:1500]   # cap to avoid huge prompts
+    except Exception as e:
+        logger.warning(f"Web search failed: {e}")
 
-    for backend in backends:
-        try:
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=max_results, backend=backend))
-
-            if results:
-                snippets = [r.get("body", "") for r in results if r.get("body")]
-                if snippets:
-                    logger.info(f"Search success via backend: {backend}")
-                    return " ".join(snippets)
-
-        except Exception as e:
-            logger.warning(f"Search failed with backend '{backend}': {e}")
-            continue
-
-    logger.error("All search backends failed")
     return ""
