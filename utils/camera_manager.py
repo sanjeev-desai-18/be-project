@@ -72,9 +72,13 @@ class CameraManager:
 
         if mode == "currency":
             w, h = model_size
+            # FrameRate requests 30 fps; FrameDurationLimits hard-clamps the
+            # sensor exposure window to [33333 µs, 33333 µs] so rpicam cannot
+            # drop below or climb above 30 fps regardless of lighting conditions.
             config = cam.create_preview_configuration(
                 main={"size": (w, h), "format": "RGB888"},
-                controls={"FrameRate": 30})
+                controls={"FrameRate": 30,
+                          "FrameDurationLimits": (33333, 33333)})
         elif mode == "reading":
             config = cam.create_still_configuration(
                 main={"size": (1920, 1080), "format": "RGB888"})

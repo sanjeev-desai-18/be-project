@@ -1,13 +1,10 @@
 """
 modules/currency/currency_detector.py
 
-VLM-verified currency detection pipeline:
-  1. Hailo 8 YOLO runs at ~30fps for real-time candidate detection.
+Hailo 8 YOLO currency detection pipeline (no VLM):
+  1. rpicam locked to 30 fps via FrameRate + FrameDurationLimits.
   2. Temporal gate confirms stable detections (4/6 frames).
-  3. On confirmation, the best frame is sent to Groq VLM in a parallel
-     thread for verification — eliminates hallucinations and rejects
-     currency shown on screens/phones.
-  4. Only VLM-verified results are spoken via TTS.
+  3. Confirmed detections are spoken directly via TTS — no VLM round-trip.
 """
 
 import cv2
@@ -20,8 +17,7 @@ from collections import deque
 
 from utils.logger import logger
 from utils.camera_manager import camera_manager
-from utils.image_utils import frame_to_base64, resize_frame
-from .currency_logic import process_predictions, speak_vlm_result
+from .currency_logic import process_predictions
 
 _DIR        = os.path.dirname(__file__)
 HEF_PATH    = os.path.join(_DIR, "yolov11s_currency.hef")
@@ -39,45 +35,11 @@ CONFIDENCE_THRESHOLD = 0.75
 
 # Temporal consistency gate — a class must appear in at least CONFIRM_HITS
 # of the last CONFIRM_WINDOW consecutive frames before TTS fires.
-# At ~20–30 fps this means ~0.15–0.25 s of stable detection before speaking.
+# At 30 fps this means ~0.13–0.2 s of stable detection before speaking.
 CONFIRM_WINDOW = 6   # rolling frame window
 CONFIRM_HITS   = 4   # minimum hits inside that window to announce
 
 WINDOW_NAME = "Currency Detection - Hailo 8"
-
-# ── VLM verification ──────────────────────────────────────────────────────────
-VLM_COOLDOWN        = 5.0     # seconds between VLM verification attempts
-VLM_CONFIDENCE_MIN  = 0.80    # minimum avg confidence to trigger VLM
-
-# High-resolution still config for VLM captures — created lazily in the
-# detection loop and reused.  switch_mode_and_capture_array briefly pauses
-# the preview stream (~300ms), grabs one 1920×1080 still, then resumes.
-VLM_STILL_SIZE = (1920, 1080)
-
-# {yolo_claims} is filled at call time with YOLO temporal-gate labels.
-_CURRENCY_VLM_PROMPT_TEMPLATE = """\
-A currency detector claims: {yolo_claims}
-
-Verify by checking the NOTE'S COLOR (Indian rupee color guide):
-  10 = chocolate brown/orange
-  20 = greenish-yellow
-  50 = fluorescent blue
-  100 = lavender / light purple
-  200 = bright yellow
-  500 = stone grey
-  2000 = magenta pink
-
-Rules:
-- If there is NO real physical currency note (wall, fabric, screen, phone, \
-printed image, or any non-note object), reply ONLY: none
-- If real note(s) exist, reply ONLY in this exact format:
-  [count] note of [denomination] rupees. Total [total] rupees.
-  Example: 1 note of 500 rupees. Total 500 rupees.
-  Example: 2 notes, 1 of 500 rupees and 1 of 100 rupees. Total 600 rupees.
-- Do NOT describe the image, hands, background, Gandhi, or anything else.
-- ONLY denomination count and total. Maximum 20 words.
-"""
-
 
 # ── Shared display frame ──────────────────────────────────────────────────────
 _frame_lock   = threading.Lock()
@@ -92,111 +54,6 @@ def get_latest_frame():
 def _set_latest_frame(frame):
     with _frame_lock:
         _latest_frame[0] = frame
-
-
-# ── VLM verification state ────────────────────────────────────────────────────
-_vlm_lock       = threading.Lock()
-_vlm_in_flight  = False          # True while a VLM call is running
-_vlm_last_time  = 0.0            # timestamp of last VLM call
-_vlm_client     = None           # lazy-loaded VLMClient singleton
-
-
-def _get_vlm_client():
-    """Lazy-load VLMClient so we don't import Groq until actually needed."""
-    global _vlm_client
-    if _vlm_client is None:
-        from modules.scene.vlm_client import VLMClient
-        _vlm_client = VLMClient()
-        logger.info("Currency VLM client initialised ✓")
-    return _vlm_client
-
-
-# Phrases in VLM response that indicate a fake / non-real detection.
-# If any of these appear, we suppress TTS entirely so the user is not
-# bothered by false positives (currency on phone screens, printed images, etc.).
-_FAKE_DETECTION_PHRASES = [
-    "on a screen",
-    "not real",
-    "not a real",
-    "no currency",
-    "no real",
-    "phone screen",
-    "digital display",
-    "printed photo",
-    "monitor",
-    "laptop screen",
-    "tv screen",
-    "television",
-    "not detected",
-    "cannot see any",
-    "cannot detect",
-    "no notes",
-    "false alarm",
-    "not a note",
-    "do not see",
-    "don't see",
-    "cannot confirm",
-    "unable to confirm",
-    "no denomination",
-]
-
-
-def _is_fake_detection(vlm_response: str) -> bool:
-    """Return True if the VLM response indicates currency is not real."""
-    stripped = vlm_response.strip().lower()
-    # Exact "none" reply — prompt tells VLM to reply this for non-currency
-    if stripped in ("none", "none."):
-        return True
-    return any(phrase in stripped for phrase in _FAKE_DETECTION_PHRASES)
-
-
-def _vlm_verify_thread(frame_bgr: np.ndarray, confirmed_labels: list):
-    """
-    Background thread: send high-res frame to VLM for currency verification.
-
-    Args:
-        frame_bgr:        High-res BGR frame (1920×1080) from switch_mode capture.
-        confirmed_labels: YOLO class labels — injected into prompt as claims.
-    """
-    global _vlm_in_flight, _vlm_last_time
-
-    try:
-        human_labels = [l.replace('_', ' ') for l in confirmed_labels]
-        yolo_claims  = ", ".join(human_labels)
-        logger.info(
-            f"VLM verify — YOLO claims: {yolo_claims} — "
-            f"frame: {frame_bgr.shape[1]}x{frame_bgr.shape[0]}"
-        )
-
-        prompt = _CURRENCY_VLM_PROMPT_TEMPLATE.format(yolo_claims=yolo_claims)
-        b64    = frame_to_base64(frame_bgr, quality=85)
-
-        vlm    = _get_vlm_client()
-        result = vlm.describe(b64, prompt)
-
-        if not result or not result.strip():
-            logger.warning("VLM returned empty response for currency")
-            return
-
-        result = result.strip()
-        logger.info(f"VLM currency response: {result[:150]}")
-
-        # ── Filter: reject false / negative detections ────────────────────
-        if _is_fake_detection(result):
-            logger.info(f"VLM rejected: {result[:80]} — suppressed")
-            return
-
-        # ── Speak the concise VLM result ──────────────────────────────────
-        speak_vlm_result(result)
-
-    except Exception as e:
-        logger.error(f"VLM currency verification failed: {e}", exc_info=True)
-
-    finally:
-        with _vlm_lock:
-            _vlm_in_flight = False
-            _vlm_last_time = time.time()
-        logger.info("VLM verify thread finished")
 
 
 # ── Hailo singleton ───────────────────────────────────────────────────────────
@@ -264,29 +121,22 @@ class _TemporalGate:
     Every frame, call update(detected_classes) with the set of class labels
     seen above CONFIDENCE_THRESHOLD.
 
-    confirmed() returns the subset of classes that have appeared in at least
-    CONFIRM_HITS of the last CONFIRM_WINDOW frames — i.e. genuinely stable
+    Returns the subset of classes that have appeared in at least
+    CONFIRM_HITS of the last CONFIRM_WINDOW frames — genuinely stable
     detections, not one-frame noise.
     """
 
     def __init__(self, window: int = CONFIRM_WINDOW, min_hits: int = CONFIRM_HITS):
         self._window   = window
         self._min_hits = min_hits
-        # label -> deque of booleans, one per recent frame
         self._history: dict[str, deque] = {}
 
     def update(self, detected_classes: set) -> set:
-        """
-        Record this frame's detections and return the confirmed set.
-        """
-        # Ensure every known class has a history entry (so absences are counted)
         all_classes = set(self._history.keys()) | detected_classes
         for cls in all_classes:
             if cls not in self._history:
                 self._history[cls] = deque(maxlen=self._window)
             self._history[cls].append(cls in detected_classes)
-
-        # A class is confirmed when it has enough hits inside the window
         return {
             cls for cls, hist in self._history.items()
             if sum(hist) >= self._min_hits
@@ -350,14 +200,10 @@ def _parse_hailo_output(hailo_output, img_w, img_h):
 
 
 # ── Per-class Non-Maximum Suppression ─────────────────────────────────────────
-# YOLO sometimes produces 2+ overlapping boxes for the same physical note
-# (especially when the note is held still for a long time).  NMS merges them
-# by keeping only the highest-confidence box when IoU > threshold.
 NMS_IOU_THRESHOLD = 0.50
 
 
 def _iou(a: dict, b: dict) -> float:
-    """Intersection over Union of two detection dicts."""
     xi1 = max(a["x1"], b["x1"])
     yi1 = max(a["y1"], b["y1"])
     xi2 = min(a["x2"], b["x2"])
@@ -370,48 +216,35 @@ def _iou(a: dict, b: dict) -> float:
 
 
 def _apply_nms(detections: list) -> list:
-    """
-    Per-class greedy NMS.  For each class, sort by confidence descending and
-    suppress any lower-confidence box that overlaps a kept box by > threshold.
-    Two different denominations in the same frame are never merged.
-    """
+    """Per-class greedy NMS — suppresses duplicate boxes for the same note."""
     if len(detections) <= 1:
         return detections
-
-    # Group by class
     by_class: dict[str, list] = {}
     for d in detections:
         by_class.setdefault(d["class"], []).append(d)
-
     kept = []
     for cls, dets in by_class.items():
-        # Sort descending by confidence
         dets.sort(key=lambda d: d["confidence"], reverse=True)
         selected = []
         for d in dets:
-            # Keep this detection only if it doesn't overlap too much
-            # with any already-selected detection of the SAME class
             if all(_iou(d, s) < NMS_IOU_THRESHOLD for s in selected):
                 selected.append(d)
         kept.extend(selected)
-
     return kept
 
 
 # ── Draw boxes ────────────────────────────────────────────────────────────────
 def _draw_boxes(frame_bgr, detections, confirmed_classes: set, fps: float = 0.0):
     """
-    Draw all candidate detections (above CONFIDENCE_THRESHOLD) in yellow.
-    Detections that have also passed the temporal gate are drawn in green.
-    This gives immediate visual feedback: yellow = seen but not confirmed yet,
-    green = stable enough to announce.
+    Yellow = candidate above threshold (not yet confirmed).
+    Green  = temporally confirmed — TTS has fired / will fire.
     """
     out = frame_bgr.copy()
     for d in detections:
         x1, y1 = int(d["x1"]), int(d["y1"])
         x2, y2 = int(d["x2"]), int(d["y2"])
         confirmed = d["class"] in confirmed_classes
-        colour = (0, 255, 0) if confirmed else (0, 215, 255)  # green / yellow
+        colour = (0, 255, 0) if confirmed else (0, 215, 255)
         txt = f"{d['class'].replace('_', ' ')}  {d['confidence']:.0%}"
         cv2.rectangle(out, (x1, y1), (x2, y2), colour, 2)
         (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
@@ -443,7 +276,6 @@ def reset():
 
 # ── Detection loop ────────────────────────────────────────────────────────────
 def _run(stop_evt, camera_released_evt):
-    global _vlm_in_flight
     logger.info("_run(): started")
     camera_released_evt.clear()
 
@@ -469,7 +301,7 @@ def _run(stop_evt, camera_released_evt):
             warmup=1.0
         )
         camera_acquired = True
-        logger.info(f"_run(): camera acquired {model_w}x{model_h}")
+        logger.info(f"_run(): camera acquired {model_w}x{model_h} @ 30fps")
     except Exception as e:
         logger.error(f"_run(): camera acquire failed: {e}", exc_info=True)
         camera_released_evt.set()
@@ -482,12 +314,6 @@ def _run(stop_evt, camera_released_evt):
         return
 
     logger.info("_run(): entering detection loop")
-
-    # High-res still config — created once, reused by switch_mode_and_capture_array.
-    # The detection loop runs at 640×640 for YOLO; this config is used ONLY when
-    # VLM verification fires to grab a single 1920×1080 still.
-    vlm_still_config = picam2.create_still_configuration(
-        main={"size": VLM_STILL_SIZE, "format": "RGB888"})
 
     fps_t = time.time(); fps_count = 0; fps = 0.0
 
@@ -523,43 +349,11 @@ def _run(stop_evt, camera_released_evt):
             if confirmed_detections:
                 logger.info(f"Confirmed: {[d['class'] for d in confirmed_detections]}")
 
-            # ── VLM verification trigger ─────────────────────────────────────
-            # On confirmed detection: capture a HIGH-RES still (1920×1080)
-            # via switch_mode_and_capture_array, then send it to VLM in a
-            # background thread.  The preview stream pauses ~300ms for the
-            # mode switch, then resumes automatically.
-            if confirmed_detections:
-                avg_conf = sum(d["confidence"] for d in confirmed_detections) / len(confirmed_detections)
-                if avg_conf >= VLM_CONFIDENCE_MIN:
-                    with _vlm_lock:
-                        now_vlm  = time.time()
-                        can_fire = (not _vlm_in_flight and
-                                    now_vlm - _vlm_last_time >= VLM_COOLDOWN)
-                    if can_fire:
-                        # Capture high-res still for VLM
-                        try:
-                            hi_res = picam2.switch_mode_and_capture_array(
-                                vlm_still_config)
-                            if hi_res.ndim == 3 and hi_res.shape[2] == 4:
-                                hi_res = hi_res[:, :, :3]
-                            logger.info(
-                                f"High-res capture: {hi_res.shape[1]}x{hi_res.shape[0]}")
-                        except Exception as e:
-                            logger.warning(
-                                f"High-res capture failed ({e}) — using 640×640")
-                            hi_res = frame.copy()
-
-                        with _vlm_lock:
-                            _vlm_in_flight = True
-                        labels = [d["class"] for d in confirmed_detections]
-                        vlm_t = threading.Thread(
-                            target=_vlm_verify_thread,
-                            args=(hi_res, labels),
-                            daemon=True,
-                            name="currency-vlm-verify",
-                        )
-                        vlm_t.start()
-                        logger.info("VLM verification thread launched")
+            # TTS fires only on confirmed detections — no VLM round-trip
+            process_predictions({
+                "predictions": confirmed_detections,
+                "image": {"width": img_w, "height": img_h},
+            })
 
             # FPS counter
             fps_count += 1
@@ -569,10 +363,6 @@ def _run(stop_evt, camera_released_evt):
                 fps_count = 0
                 fps_t = now
 
-            # ── Display: push every frame unconditionally ─────────────────────
-            # The output window must be live from the very first captured frame,
-            # regardless of whether any currency has been detected yet.
-            # Candidate boxes are yellow; confirmed (announced) boxes are green.
             _set_latest_frame(_draw_boxes(frame, detections, confirmed_classes, fps))
 
     except Exception as e:
@@ -585,7 +375,7 @@ def _run(stop_evt, camera_released_evt):
                 logger.info("_run(): camera released")
             except Exception as e:
                 logger.warning(f"_run(): camera release error: {e}")
-        _set_latest_frame(None)   # signal main thread: detection stopped
+        _set_latest_frame(None)
         camera_released_evt.set()
         logger.info("_run(): fully exited")
 
