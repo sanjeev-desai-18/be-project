@@ -1,20 +1,26 @@
 """
 modules/currency/currency_logic.py
 ───────────────────────────────────
-Processes YOLOv11 detection output and triggers TTS announcements.
+Processes confirmed note tracks and triggers TTS announcements.
 
-Logic:
-  - Collects all detected denominations in a frame
-  - Announces each unique denomination with a per-class cooldown (3 s)
-  - Summarises totals when multiple notes are visible ("2 notes: 500 and 100 rupees")
-  - Thread-safe via a per-function state dict
+Called by currency_detector.py with a list of track dicts that have:
+  - confirmed_cls  : str   (majority-voted denomination, locked)
+  - track_id       : int   (persistent ID for this physical note)
+  - announce_count : int   (how many times TTS has already fired for it)
+
+Each track is spoken up to ANNOUNCE_REPEAT times (set in currency_detector),
+after which the detector stops passing it here. This file enforces an
+inter-announcement cooldown so rapid back-to-back calls don't stack TTS.
+
+Returns the list of track_ids that were actually spoken this call so the
+detector can increment announce_count via mark_announced().
 """
 
 import time
 import threading
 from utils.logger import logger
 
-# ── Shared TTS speaker (singleton for currency module) ────────────────────────
+# ── Shared TTS speaker ────────────────────────────────────────────────────────
 _speaker      = None
 _speaker_lock = threading.Lock()
 
@@ -31,7 +37,6 @@ def _get_speaker():
 
 
 def speak(text: str):
-    """Speak text via the shared Speaker instance."""
     try:
         spk = _get_speaker()
         if spk:
@@ -42,152 +47,92 @@ def speak(text: str):
         logger.error(f"TTS error in currency_logic: {e}")
 
 
-# ── Per-class cooldown state ───────────────────────────────────────────────────
-_last_spoken:    dict  = {}    # class_label -> last spoken timestamp
-_last_summary:   float = 0.0   # timestamp of last multi-note summary
-_state_lock               = threading.Lock()
+# ── Cooldown between successive announcements ─────────────────────────────────
+# Prevents TTS from firing twice in the same breath when multiple confirmed
+# tracks exist at once. Each track gets its own last-spoken timestamp.
+_track_last_spoken: dict[int, float] = {}   # track_id -> timestamp
+_state_lock = threading.Lock()
 
-SINGLE_COOLDOWN  = 3.0   # seconds before re-announcing the same denomination
-SUMMARY_COOLDOWN = 5.0   # seconds before re-announcing a multi-note summary
+# Minimum gap between the 1st and 2nd announcement for the same track.
+# At 30 fps a confirmed track fires its 1st announcement immediately;
+# the 2nd fires after this cooldown so the user hears them distinctly.
+REPEAT_COOLDOWN = 4.0   # seconds between announcement 1 and announcement 2
+
+# Minimum gap between any two TTS calls globally (avoids overlapping speech).
+GLOBAL_COOLDOWN  = 1.5  # seconds
+_last_any_spoken: float = 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN PROCESSOR — called from currency_detector.py every inference frame
+# MAIN ENTRY POINT — called from currency_detector._run() each frame
 # ══════════════════════════════════════════════════════════════════════════════
-def process_predictions(result: dict):
+def process_confirmed_notes(tracks: list) -> list[int]:
     """
-    Receive a detection result dict and decide what to speak.
+    Decide which confirmed tracks to announce and speak them.
 
     Args:
-        result: {
-            "predictions": [
-                {"class": "500_rupees", "confidence": 0.87, ...},
-                ...
-            ],
-            "image": {"width": ..., "height": ...}
-        }
+        tracks: list of dicts from _NoteTracker.update(), already filtered to
+                those with confirmed_cls != None and announce_count < ANNOUNCE_REPEAT.
+                Each dict has at minimum:
+                  track_id, confirmed_cls, announce_count, confidence
+
+    Returns:
+        List of track_ids that were spoken this call.
+        The detector calls mark_announced(tid) for each returned id.
     """
-    global _last_summary
+    global _last_any_spoken
 
-    try:
-        predictions = _extract_predictions(result)
-        if not predictions:
-            return
-
-        now = time.time()
-
-        # ── Filter by confidence (already done in detector, but double-check) ──
-        valid = [p for p in predictions if p.get("confidence", 0) >= 0.50]
-        if not valid:
-            return
-
-        # ── Collect unique labels detected this frame ─────────────────────────
-        detected_labels = []
-        seen = set()
-        for p in valid:
-            label = p.get("class") or p.get("class_name") or ""
-            if label and label not in seen:
-                seen.add(label)
-                detected_labels.append(label)
-
-        if not detected_labels:
-            return
-
-        # ── Multi-note summary ────────────────────────────────────────────────
-        if len(detected_labels) > 1:
-            if now - _last_summary >= SUMMARY_COOLDOWN:
-                human_labels = [_human(l) for l in detected_labels]
-                msg = f"{len(human_labels)} notes detected: {', '.join(human_labels)}"
-                logger.info(f"Currency summary: {msg}")
-                speak(msg)
-                with _state_lock:
-                    _last_summary = now
-                    for label in detected_labels:
-                        _last_spoken[label] = now
-            return
-
-        # ── Single note ───────────────────────────────────────────────────────
-        label = detected_labels[0]
-        with _state_lock:
-            last_t = _last_spoken.get(label, 0.0)
-
-        if now - last_t >= SINGLE_COOLDOWN:
-            msg = f"{_human(label)} detected"
-            logger.info(f"Currency: {msg}")
-            speak(msg)
-            with _state_lock:
-                _last_spoken[label] = now
-
-    except Exception as e:
-        logger.error(f"Error in process_predictions: {e}", exc_info=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
-def _extract_predictions(result) -> list:
-    """
-    Normalise various result formats into a flat list of prediction dicts.
-    Handles: dict with 'predictions' key, plain list, or nested list.
-    """
-    if isinstance(result, dict):
-        preds = (result.get("predictions") or
-                 result.get("output") or
-                 result.get("detections"))
-        if preds is None:
-            return []
-        return _extract_predictions(preds)
-
-    if isinstance(result, list):
-        if not result:
-            return []
-        first = result[0]
-        # Nested list of dicts
-        if isinstance(first, dict):
-            return result
-        # List of lists — try inner
-        if isinstance(first, list):
-            return _extract_predictions(first)
-
-    return []
-
-
-def _human(label: str) -> str:
-    """
-    Convert snake_case label to natural speech.
-    '500_rupees' → '500 rupees'
-    '10_rupees'  → '10 rupees'
-    """
-    return label.replace("_", " ")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# VLM-VERIFIED RESULT SPEAKER
-# ══════════════════════════════════════════════════════════════════════════════
-_last_vlm_spoken: float = 0.0
-VLM_SPEAK_COOLDOWN = 5.0   # seconds between VLM-verified announcements
-
-
-def speak_vlm_result(vlm_text: str):
-    """
-    Speak the VLM verification result via TTS.
-
-    Called from the VLM verification thread in currency_detector.py.
-    Enforces a cooldown to avoid rapid-fire announcements.
-    """
-    global _last_vlm_spoken
-
-    if not vlm_text or not vlm_text.strip():
-        logger.warning("speak_vlm_result: empty text — skipping")
-        return
+    if not tracks:
+        return []
 
     now = time.time()
-    with _state_lock:
-        if now - _last_vlm_spoken < VLM_SPEAK_COOLDOWN:
-            logger.debug("speak_vlm_result: cooldown active — skipping")
-            return
-        _last_vlm_spoken = now
+    announced: list[int] = []
 
-    logger.info(f"VLM currency result: {vlm_text[:120]}")
-    speak(vlm_text)
+    # Sort by track_id so multi-note announcements are deterministic
+    for t in sorted(tracks, key=lambda x: x["track_id"]):
+        tid   = t["track_id"]
+        cls   = t["confirmed_cls"]
+        cnt   = t["announce_count"]  # 0 = first time, 1 = second time
 
+        with _state_lock:
+            last_t     = _track_last_spoken.get(tid, 0.0)
+            last_any   = _last_any_spoken
+
+        # First announcement fires as soon as gate passes (no per-track delay).
+        # Second announcement requires REPEAT_COOLDOWN since the first.
+        if cnt > 0 and now - last_t < REPEAT_COOLDOWN:
+            logger.debug(
+                f"track #{tid}: repeat cooldown active "
+                f"({now - last_t:.1f}s / {REPEAT_COOLDOWN}s)"
+            )
+            continue
+
+        # Global cooldown — don't overlap with previous TTS call
+        if now - last_any < GLOBAL_COOLDOWN:
+            logger.debug(f"track #{tid}: global cooldown active")
+            continue
+
+        msg = _build_message(cls, cnt)
+        logger.info(f"Currency TTS track #{tid} (ann #{cnt+1}): {msg}")
+        speak(msg)
+
+        with _state_lock:
+            _track_last_spoken[tid] = now
+            _last_any_spoken        = now
+
+        announced.append(tid)
+
+    return announced
+
+
+# ── Message builder ───────────────────────────────────────────────────────────
+def _build_message(cls: str, announce_count: int) -> str:
+    """
+    First announcement  : "500 rupees detected"
+    Second announcement : "500 rupees confirmed"
+    (Extra redundancy helps visually impaired users be certain of the value.)
+    """
+    human = cls.replace("_", " ")
+    if announce_count == 0:
+        return f"{human} detected"
+    return f"{human} confirmed"
