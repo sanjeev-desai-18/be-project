@@ -8,6 +8,14 @@
 # cv2.imshow / cv2.imencode without colour conversion.
 # For Hailo inference (expects RGB), convert BGR→RGB before hailo.run().
 #
+# ROTATION NOTE:
+# The camera is physically mounted upside-down (180°). Rotation is handled
+# via libcamera's Transform(hflip=1, vflip=1) at configure time — applied
+# once in the ISP hardware during Bayer→RGB demosaic, zero per-frame CPU cost.
+# Do NOT use rotation=180 in dtoverlay=imx708 in config.txt — it conflicts
+# with libcamera's transform and is silently ignored on newer libcamera builds.
+# config.txt should have: dtoverlay=imx708  (no rotation param)
+#
 # WHY _verify_frames_flowing() WAS REMOVED:
 # ──────────────────────────────────────────
 # _verify_frames_flowing() called capture_array() in a daemon thread to
@@ -36,6 +44,7 @@
 
 import threading
 import time
+from libcamera import Transform
 from utils.logger import logger
 
 
@@ -70,6 +79,10 @@ class CameraManager:
         # that were queued before stop() was called.
         time.sleep(0.3)
 
+        # 180° rotation via ISP hardware transform — zero per-frame CPU cost.
+        # hflip=1 + vflip=1 is mathematically equivalent to rotation=180.
+        flip = Transform(hflip=1, vflip=1)
+
         if mode == "currency":
             w, h = model_size
             # FrameRate requests 30 fps; FrameDurationLimits hard-clamps the
@@ -77,19 +90,23 @@ class CameraManager:
             # drop below or climb above 30 fps regardless of lighting conditions.
             config = cam.create_preview_configuration(
                 main={"size": (w, h), "format": "RGB888"},
+                transform=flip,
                 controls={"FrameRate": 30,
                           "FrameDurationLimits": (33333, 33333)})
         elif mode == "reading":
             config = cam.create_still_configuration(
-                main={"size": (1920, 1080), "format": "RGB888"})
+                main={"size": (1920, 1080), "format": "RGB888"},
+                transform=flip)
         elif mode == "scene":
             # Full native resolution — imx708_wide_noir selects 2304x1296
             # sensor mode when asked for this size (score 1000 = exact match).
             config = cam.create_still_configuration(
-                main={"size": (2304, 1296), "format": "RGB888"})
+                main={"size": (2304, 1296), "format": "RGB888"},
+                transform=flip)
         else:
             config = cam.create_preview_configuration(
-                main={"size": (1024, 768), "format": "RGB888"})
+                main={"size": (1024, 768), "format": "RGB888"},
+                transform=flip)
 
         cam.configure(config)
         self._mode = mode
