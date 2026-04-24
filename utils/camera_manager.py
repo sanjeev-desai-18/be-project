@@ -73,7 +73,8 @@ class CameraManager:
         if mode == "currency":
             w, h = model_size
             config = cam.create_preview_configuration(
-                main={"size": (w, h), "format": "RGB888"})
+                main={"size": (w, h), "format": "RGB888"},
+                controls={"FrameRate": 30})
         elif mode == "reading":
             config = cam.create_still_configuration(
                 main={"size": (1920, 1080), "format": "RGB888"})

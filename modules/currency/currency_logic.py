@@ -159,3 +159,35 @@ def _human(label: str) -> str:
     '10_rupees'  → '10 rupees'
     """
     return label.replace("_", " ")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VLM-VERIFIED RESULT SPEAKER
+# ══════════════════════════════════════════════════════════════════════════════
+_last_vlm_spoken: float = 0.0
+VLM_SPEAK_COOLDOWN = 5.0   # seconds between VLM-verified announcements
+
+
+def speak_vlm_result(vlm_text: str):
+    """
+    Speak the VLM verification result via TTS.
+
+    Called from the VLM verification thread in currency_detector.py.
+    Enforces a cooldown to avoid rapid-fire announcements.
+    """
+    global _last_vlm_spoken
+
+    if not vlm_text or not vlm_text.strip():
+        logger.warning("speak_vlm_result: empty text — skipping")
+        return
+
+    now = time.time()
+    with _state_lock:
+        if now - _last_vlm_spoken < VLM_SPEAK_COOLDOWN:
+            logger.debug("speak_vlm_result: cooldown active — skipping")
+            return
+        _last_vlm_spoken = now
+
+    logger.info(f"VLM currency result: {vlm_text[:120]}")
+    speak(vlm_text)
+
