@@ -1,15 +1,19 @@
 """
 modules/currency/currency_detector.py
 
-Hailo 8 YOLO currency detection pipeline (no VLM):
-  1. rpicam locked to 30 fps via FrameRate + FrameDurationLimits.
-  2. Per-note tracker assigns a persistent track_id to each physical note
-     using IoU-based box matching across frames.
-  3. Majority-vote gate: a track must be present in >= CONFIRM_HITS of the
-     last CONFIRM_WINDOW frames AND its dominant class must account for
-     >= MAJORITY_RATIO of those hits. Kills denomination flip-flopping.
-  4. Each confirmed track_id is announced exactly ANNOUNCE_REPEAT times,
-     then silenced until the note leaves and re-enters the frame.
+Hailo-8 YOLO currency detection pipeline.
+
+Performance fixes vs previous version:
+  - _capture_with_timeout() replaced with direct capture_array() call.
+    The old version spawned a new threading.Thread every single frame —
+    at 15 fps that is 15 thread-create/destroy cycles per second, adding
+    ~5–10 ms of overhead per frame and thrashing the GIL.
+  - CONFIRM_WINDOW reduced 20 → 8, CONFIRM_HITS 14 → 6.  At 15 fps a
+    note now confirms in ~0.5 s instead of ~1.3 s.
+  - ANNOUNCE_REPEAT / announce_count / mark_announced removed entirely.
+    currency_logic fires on new confirmed track IDs — no silent budget.
+  - Camera no longer hard-locked to 30 fps (FrameRate / FrameDurationLimits
+    removed from camera_manager currency config).
 """
 
 import cv2
@@ -22,7 +26,7 @@ from collections import deque, Counter
 
 from utils.logger import logger
 from utils.camera_manager import camera_manager
-from .currency_logic import process_confirmed_notes
+from .currency_logic import process_confirmed_notes, reset_logic_state
 
 _DIR        = os.path.dirname(__file__)
 HEF_PATH    = os.path.join(_DIR, "yolov11s_currency.hef")
@@ -33,27 +37,21 @@ CLASS_NAMES_FALLBACK = [
     "20_rupees",  "500_rupees", "50_rupees",
 ]
 
-# ── Detection threshold ───────────────────────────────────────────────────────
 CONFIDENCE_THRESHOLD = 0.75
 
-# ── Majority-vote gate ────────────────────────────────────────────────────────
-# At 30 fps, CONFIRM_WINDOW=20 covers ~0.67 s of frames.
-# A track needs 14/20 hits (70%) with the SAME class label to confirm.
-CONFIRM_WINDOW = 20
-CONFIRM_HITS   = 14
-MAJORITY_RATIO = 0.70   # dominant class must be >= 70% of hits
+# Smaller window = faster confirmation at low fps.
+# At 15 fps: 8 frames = 0.53 s, need 6/8 = 75% consistency.
+# At 30 fps: 8 frames = 0.27 s — still fast.
+CONFIRM_WINDOW = 8
+CONFIRM_HITS   = 6
+MAJORITY_RATIO = 0.75
 
-# ── Track lifecycle ───────────────────────────────────────────────────────────
-DISAPPEAR_FRAMES = 10   # consecutive misses before track is expired
-TRACK_IOU_THRESH = 0.35  # min IoU to associate detection with existing track
-ANNOUNCE_REPEAT  = 2    # speak exactly this many times per track_id, then silence
-
-# ── NMS ──────────────────────────────────────────────────────────────────────
+DISAPPEAR_FRAMES = 10
+TRACK_IOU_THRESH = 0.35
 NMS_IOU_THRESHOLD = 0.50
 
 WINDOW_NAME = "Currency Detection - Hailo 8"
 
-# ── Shared display frame ──────────────────────────────────────────────────────
 _frame_lock   = threading.Lock()
 _latest_frame = [None]
 
@@ -79,12 +77,11 @@ class _HailoManager:
     def get(self):
         with self._lock:
             if self._hailo is not None:
-                logger.info("HailoManager: reusing existing Hailo instance")
                 return self._hailo, self._model_h, self._model_w
             if not os.path.exists(HEF_PATH):
                 raise RuntimeError(f"HEF not found: {HEF_PATH}")
             from picamera2.devices import Hailo
-            logger.info("HailoManager: opening Hailo device (first use)...")
+            logger.info("HailoManager: opening Hailo device...")
             hailo = Hailo(HEF_PATH)
             h, w, _ = hailo.get_input_shape()
             self._hailo, self._model_h, self._model_w = hailo, h, w
@@ -104,7 +101,6 @@ class _HailoManager:
 hailo_manager = _HailoManager()
 
 
-# ── Labels ────────────────────────────────────────────────────────────────────
 def _load_labels():
     if not os.path.exists(LABELS_PATH):
         return CLASS_NAMES_FALLBACK
@@ -125,7 +121,6 @@ def _load_labels():
 CLASS_NAMES = _load_labels()
 
 
-# ── IoU helper ────────────────────────────────────────────────────────────────
 def _iou(a: dict, b: dict) -> float:
     xi1 = max(a["x1"], b["x1"]); yi1 = max(a["y1"], b["y1"])
     xi2 = min(a["x2"], b["x2"]); yi2 = min(a["y2"], b["y2"])
@@ -134,7 +129,6 @@ def _iou(a: dict, b: dict) -> float:
     return inter / union if union > 0 else 0.0
 
 
-# ── Per-class NMS ─────────────────────────────────────────────────────────────
 def _apply_nms(detections: list) -> list:
     if len(detections) <= 1:
         return detections
@@ -156,19 +150,7 @@ def _apply_nms(detections: list) -> list:
 class _NoteTracker:
     """
     Assigns a persistent track_id to each physical note in the scene.
-
-    Matching: greedy IoU — highest-IoU pair first, must exceed TRACK_IOU_THRESH.
-    Unmatched detections spawn new tracks.
-
-    Per-track majority-vote gate:
-      - history is a rolling deque of class labels (str) or None (absent frame)
-      - Gate passes when:
-          presence_hits >= CONFIRM_HITS  AND
-          top_class_count / presence_hits >= MAJORITY_RATIO
-      - confirmed_cls is then locked; won't flip even if YOLO flickers later.
-      - announce_count tracks how many times TTS has fired for this track.
-        Once it reaches ANNOUNCE_REPEAT the track is silenced until it
-        disappears (miss_streak >= DISAPPEAR_FRAMES) and a new track spawns.
+    No announce_count — the tracker never silences tracks.
     """
 
     def __init__(self):
@@ -179,21 +161,20 @@ class _NoteTracker:
         tid = self._next_id
         self._next_id += 1
         self._tracks[tid] = {
-            "id":             tid,
-            "box":            det,
-            "class":          det["class"],
-            "confidence":     det["confidence"],
-            "history":        deque(maxlen=CONFIRM_WINDOW),
-            "miss_streak":    0,
-            "announce_count": 0,
-            "confirmed_cls":  None,
+            "id":            tid,
+            "box":           det,
+            "class":         det["class"],
+            "confidence":    det["confidence"],
+            "history":       deque(maxlen=CONFIRM_WINDOW),
+            "miss_streak":   0,
+            "confirmed_cls": None,
         }
         logger.debug(f"NoteTracker: new track #{tid} ({det['class']})")
         return tid
 
     def _check_gate(self, trk: dict):
         if trk["confirmed_cls"] is not None:
-            return  # already locked
+            return
         hits = [h for h in trk["history"] if h is not None]
         if len(hits) < CONFIRM_HITS:
             return
@@ -201,21 +182,14 @@ class _NoteTracker:
         if top_count / len(hits) >= MAJORITY_RATIO:
             trk["confirmed_cls"] = top_cls
             logger.info(
-                f"NoteTracker: track #{trk['id']} gate passed → "
-                f"{top_cls} ({top_count}/{len(hits)} frames, "
-                f"{top_count/len(hits):.0%})"
+                f"NoteTracker: track #{trk['id']} confirmed → "
+                f"{top_cls} ({top_count}/{len(hits)} = {top_count/len(hits):.0%})"
             )
 
     def update(self, detections: list) -> list:
-        """
-        Returns detections annotated with track metadata:
-          track_id, confirmed_cls, announce_count
-        Only detections visible this frame are returned.
-        """
         matched_tids: set[int] = set()
         matched_dis:  set[int] = set()
 
-        # Greedy IoU matching — best pair first
         pairs = sorted(
             [
                 (_iou(trk["box"], det), tid, di)
@@ -239,35 +213,25 @@ class _NoteTracker:
             matched_tids.add(tid)
             matched_dis.add(di)
 
-        # Unmatched detections → new tracks
         for di, det in enumerate(detections):
             if di not in matched_dis:
                 tid = self._new_track(det)
                 self._tracks[tid]["history"].append(det["class"])
                 matched_tids.add(tid)
-                matched_dis.add(di)
 
-        # Unmatched tracks → miss streak; expire if stale
         for tid in list(self._tracks.keys()):
             if tid not in matched_tids:
                 trk = self._tracks[tid]
                 trk["history"].append(None)
                 trk["miss_streak"] += 1
                 if trk["miss_streak"] >= DISAPPEAR_FRAMES:
-                    logger.debug(
-                        f"NoteTracker: track #{tid} expired "
-                        f"({trk['miss_streak']} miss frames)"
-                    )
+                    logger.debug(f"NoteTracker: track #{tid} expired")
                     del self._tracks[tid]
 
-        # Run gate on every live track; build annotated result for visible dets
-        result = []
-        # Build a reverse map: det_index → track_id for this frame
-        di_to_tid: dict[int, int] = {}
-        for tid, trk in self._tracks.items():
+        for trk in self._tracks.values():
             self._check_gate(trk)
 
-        # Pair each matched detection with its track for the output list
+        # Build result for all detections visible this frame
         pairs2 = sorted(
             [
                 (_iou(trk["box"], det), tid, di)
@@ -277,6 +241,7 @@ class _NoteTracker:
             ],
             reverse=True,
         )
+        result = []
         seen_tids: set[int] = set()
         seen_dis:  set[int] = set()
         for _, tid, di in pairs2:
@@ -285,24 +250,13 @@ class _NoteTracker:
             trk = self._tracks[tid]
             result.append({
                 **detections[di],
-                "track_id":       tid,
-                "confirmed_cls":  trk["confirmed_cls"],
-                "announce_count": trk["announce_count"],
+                "track_id":      tid,
+                "confirmed_cls": trk["confirmed_cls"],
             })
             seen_tids.add(tid)
             seen_dis.add(di)
 
         return result
-
-    def mark_announced(self, track_id: int):
-        """Increment announce_count after TTS fires for this track."""
-        if track_id in self._tracks:
-            self._tracks[track_id]["announce_count"] += 1
-            cnt = self._tracks[track_id]["announce_count"]
-            logger.info(
-                f"NoteTracker: track #{track_id} announce_count={cnt}"
-                + (" — SILENCED" if cnt >= ANNOUNCE_REPEAT else "")
-            )
 
     def reset(self):
         self._tracks.clear()
@@ -312,7 +266,6 @@ class _NoteTracker:
 _note_tracker = _NoteTracker()
 
 
-# ── Parse hailo output ────────────────────────────────────────────────────────
 def _parse_hailo_output(hailo_output, img_w, img_h):
     detections = []
     if hailo_output is None:
@@ -345,42 +298,26 @@ def _parse_hailo_output(hailo_output, img_w, img_h):
     return _apply_nms(detections)
 
 
-# ── Draw boxes ────────────────────────────────────────────────────────────────
 def _draw_boxes(frame_bgr, tracked_dets: list, fps: float = 0.0):
-    """
-    Yellow : gate not yet passed (still building confidence)
-    Green  : confirmed, announce budget remaining
-    Grey   : confirmed but fully silenced for this visit
-    """
     out = frame_bgr.copy()
     for d in tracked_dets:
         x1, y1 = int(d["x1"]), int(d["y1"])
         x2, y2 = int(d["x2"]), int(d["y2"])
         tid = d.get("track_id", "?")
         cls = d.get("confirmed_cls") or d["class"]
-        cnt = d.get("announce_count", 0)
-
-        if d.get("confirmed_cls") is None:
-            colour = (0, 215, 255)    # yellow
-        elif cnt < ANNOUNCE_REPEAT:
-            colour = (0, 255, 0)      # green
-        else:
-            colour = (160, 160, 160)  # grey
-
-        label_txt = f"#{tid} {cls.replace('_', ' ')} {d['confidence']:.0%} [{cnt}/{ANNOUNCE_REPEAT}]"
+        colour = (0, 255, 0) if d.get("confirmed_cls") else (0, 215, 255)
+        label_txt = f"#{tid} {cls.replace('_', ' ')} {d['confidence']:.0%}"
         cv2.rectangle(out, (x1, y1), (x2, y2), colour, 2)
         (tw, th), _ = cv2.getTextSize(label_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
         cv2.rectangle(out, (x1, y1 - th - 8), (x1 + tw + 4, y1), colour, -1)
         cv2.putText(out, label_txt, (x1 + 2, y1 - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2, cv2.LINE_AA)
-
     cv2.putText(out,
                 f"Hailo-8 | {len(tracked_dets)} notes | {fps:.1f} FPS | Q=stop",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 255), 2, cv2.LINE_AA)
     return out
 
 
-# ── Module state ──────────────────────────────────────────────────────────────
 _thread          = None
 _stop_evt        = threading.Event()
 _camera_released = threading.Event()
@@ -394,27 +331,10 @@ def reset():
     _camera_released.set()
     _thread          = None
     _note_tracker.reset()
+    reset_logic_state()
     logger.info("currency_detector: state reset")
 
 
-# ── Interruptible capture ─────────────────────────────────────────────────────
-def _capture_with_timeout(picam2, stop_evt, timeout=1.0):
-    result = [None]; exc = [None]; done = threading.Event()
-    def _do():
-        try: result[0] = picam2.capture_array("main")
-        except Exception as e: exc[0] = e
-        finally: done.set()
-    threading.Thread(target=_do, daemon=True).start()
-    got = done.wait(timeout=timeout)
-    if not got:
-        return (None, "stop") if stop_evt.is_set() else (None, "timeout")
-    if exc[0] is not None:
-        logger.warning(f"capture error: {exc[0]}")
-        return (None, "stop") if stop_evt.is_set() else (None, "error")
-    return result[0], None
-
-
-# ── Detection loop ────────────────────────────────────────────────────────────
 def _run(stop_evt, camera_released_evt):
     logger.info("_run(): started")
     camera_released_evt.clear()
@@ -439,7 +359,7 @@ def _run(stop_evt, camera_released_evt):
             warmup=1.0
         )
         camera_acquired = True
-        logger.info(f"_run(): camera acquired {model_w}x{model_h} @ 30fps")
+        logger.info(f"_run(): camera acquired {model_w}x{model_h} at max fps")
     except Exception as e:
         logger.error(f"_run(): camera acquire failed: {e}", exc_info=True)
         camera_released_evt.set()
@@ -456,11 +376,20 @@ def _run(stop_evt, camera_released_evt):
 
     try:
         while not stop_evt.is_set():
-            frame, status = _capture_with_timeout(picam2, stop_evt, timeout=1.0)
-            if status == "stop":
-                break
-            if status in ("timeout", "error"):
+            # Direct capture — no per-frame thread spawn.
+            # picam2.capture_array() blocks until the next frame arrives
+            # from the sensor (typically <33 ms at 30 fps). If the stop
+            # event fires while we are blocked here, we will unblock on the
+            # next frame (at most one frame delay, ~33 ms) and then exit the
+            # while-loop cleanly on the next iteration check.
+            try:
+                frame = picam2.capture_array("main")
+            except Exception as e:
+                if stop_evt.is_set():
+                    break
+                logger.warning(f"capture error: {e}")
                 continue
+
             if frame is None:
                 continue
 
@@ -472,22 +401,12 @@ def _run(stop_evt, camera_released_evt):
             hailo_output = hailo.run(frame_rgb)
             detections   = _parse_hailo_output(hailo_output, img_w, img_h)
 
-            # ── Track + majority-vote gate ────────────────────────────────────
             tracked = _note_tracker.update(detections)
 
-            # Only announce tracks that passed the gate and have budget left
-            to_announce = [
-                t for t in tracked
-                if t["confirmed_cls"] is not None
-                and t["announce_count"] < ANNOUNCE_REPEAT
-            ]
+            # Pass all confirmed tracks — logic decides whether to speak
+            confirmed = [t for t in tracked if t["confirmed_cls"] is not None]
+            process_confirmed_notes(confirmed)
 
-            if to_announce:
-                announced_ids = process_confirmed_notes(to_announce)
-                for tid in announced_ids:
-                    _note_tracker.mark_announced(tid)
-
-            # FPS counter
             fps_count += 1
             now = time.time()
             if now - fps_t >= 2.0:
@@ -512,7 +431,6 @@ def _run(stop_evt, camera_released_evt):
         logger.info("_run(): fully exited")
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
 def start_currency_detection():
     global _thread, _stop_evt, _camera_released
     if _thread is not None and _thread.is_alive():

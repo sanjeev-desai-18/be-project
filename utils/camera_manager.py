@@ -90,9 +90,7 @@ class CameraManager:
             # drop below or climb above 30 fps regardless of lighting conditions.
             config = cam.create_preview_configuration(
                 main={"size": (w, h), "format": "RGB888"},
-                transform=flip,
-                controls={"FrameRate": 30,
-                          "FrameDurationLimits": (33333, 33333)})
+                transform=flip)
         elif mode == "reading":
             config = cam.create_still_configuration(
                 main={"size": (1920, 1080), "format": "RGB888"},
