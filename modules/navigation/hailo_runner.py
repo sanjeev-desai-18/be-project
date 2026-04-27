@@ -118,6 +118,9 @@ class HailoDepthRunner:
 
     def close(self):
         try:
+            if self._network is not None:
+                self._network.deactivate()
+                self._network = None
             if self._target is not None:
                 self._target.release()
                 self._target = None
@@ -129,11 +132,12 @@ class HailoDepthRunner:
 
     def _load_hailo(self):
         self._hef    = HEF(self.hef_path)
-        self._target = VDevice()
+        self._target = VDevice(device_count=1)
         cfg_params   = ConfigureParams.create_from_hef(
             self._hef, interface=HailoStreamInterface.PCIe
         )
         self._network = self._target.configure(self._hef, cfg_params)[0]
+        self._network.activate()
 
     def _estimate_hailo(self, bgr_frame: np.ndarray) -> np.ndarray:
         orig_h, orig_w = bgr_frame.shape[:2]
@@ -296,6 +300,9 @@ class HailoYOLORunner:
 
     def close(self):
         try:
+            if self._network is not None:
+                self._network.deactivate()
+                self._network = None
             if self._target is not None:
                 self._target.release()
                 self._target = None
@@ -307,11 +314,12 @@ class HailoYOLORunner:
 
     def _load_hailo(self):
         self._hef    = HEF(self.hef_path)
-        self._target = VDevice()
+        self._target = VDevice(device_count=1)
         cfg_params   = ConfigureParams.create_from_hef(
             self._hef, interface=HailoStreamInterface.PCIe
         )
         self._network = self._target.configure(self._hef, cfg_params)[0]
+        self._network.activate()
 
     def _detect_hailo(self, bgr_frame: np.ndarray) -> list:
         orig_h, orig_w = bgr_frame.shape[:2]
