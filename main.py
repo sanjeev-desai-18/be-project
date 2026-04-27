@@ -26,7 +26,7 @@ from core.state import AssistantState
 
 speaker = Speaker()
 
-WINDOW_NAME = "Currency Detection - Hailo 8"
+WINDOW_NAME = "Blind Assistant - Hailo 8"
 
 
 # ══════════════════════════════════════════════
@@ -97,7 +97,10 @@ def mic_loop():
         return
 
     logger.info("Microphone loop started — listening for commands")
-    speaker.speak("Blind assistant ready. Say currency check to detect notes.")
+    speaker.speak(
+        "Blind assistant ready. "
+        "Say currency check, activate navigation, or describe surroundings."
+    )
 
     while True:
         try:
@@ -114,50 +117,64 @@ def mic_loop():
 
 # ══════════════════════════════════════════════
 # DISPLAY LOOP — runs on main thread
-# cv2 imshow/waitKey must be called from the
-# same thread (main) on Linux Qt/GTK backends.
-# _run() writes frames to shared memory,
-# this loop reads and renders them at ~30fps.
+# Priority order for frame display:
+#   1. Navigation (real-time, two-panel)
+#   2. Currency   (real-time, detection overlay)
+#   3. Scene      (static captured image)
+#   4. Waiting    (blank placeholder)
 # ══════════════════════════════════════════════
 def display_loop():
     import cv2
     import numpy as np
-    from modules.currency.currency_detector import get_latest_frame
+    from modules.currency.currency_detector import get_latest_frame as get_currency_frame
     from modules.scene.scene_module import get_latest_scene_frame
+    from modules.navigation.navigation_module import get_latest_nav_frame
 
     window_open = False
-
-    # Track which scene frame we last showed so we only re-render on change
     _last_scene_id: list = [None]
 
-    # Blank "waiting" frame shown when nothing is running
-    waiting = np.zeros((540, 960, 3), dtype=np.uint8)
-    cv2.putText(waiting, "Waiting for currency detection...",
-                (160, 270), cv2.FONT_HERSHEY_SIMPLEX,
+    # ── Placeholder frames ────────────────────────────────────────────────
+    waiting = np.zeros((380, 960, 3), dtype=np.uint8)
+    cv2.putText(waiting, "Waiting for a command…",
+                (280, 190), cv2.FONT_HERSHEY_SIMPLEX,
                 0.8, (80, 80, 80), 2, cv2.LINE_AA)
+    cv2.putText(waiting,
+                "Say: 'activate navigation' | 'currency check' | 'describe surroundings'",
+                (60, 230), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (60, 60, 60), 1, cv2.LINE_AA)
 
-    stopped = np.zeros((540, 960, 3), dtype=np.uint8)
-    cv2.putText(stopped, "Currency detection stopped",
-                (210, 270), cv2.FONT_HERSHEY_SIMPLEX,
+    stopped = np.zeros((380, 960, 3), dtype=np.uint8)
+    cv2.putText(stopped, "Module stopped",
+                (360, 190), cv2.FONT_HERSHEY_SIMPLEX,
                 0.8, (80, 80, 80), 2, cv2.LINE_AA)
 
     logger.info("Display loop started on main thread")
 
     while True:
-        currency_frame = get_latest_frame()
+        nav_frame      = get_latest_nav_frame()
+        currency_frame = get_currency_frame()
         scene_frame    = get_latest_scene_frame()
 
-        if currency_frame is not None:
-            # Live currency detection — always takes priority
+        # ── 1. Navigation (highest priority — real-time) ─────────────────
+        if nav_frame is not None:
+            if not window_open:
+                cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(WINDOW_NAME, 960, 380)
+                window_open = True
+                logger.info("Display: window opened for navigation")
+            cv2.imshow(WINDOW_NAME, nav_frame)
+
+        # ── 2. Currency (real-time detection overlay) ────────────────────
+        elif currency_frame is not None:
             if not window_open:
                 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
                 cv2.resizeWindow(WINDOW_NAME, 960, 540)
                 window_open = True
-                logger.info("Display: window opened")
+                logger.info("Display: window opened for currency")
             cv2.imshow(WINDOW_NAME, currency_frame)
 
+        # ── 3. Scene (static captured image) ────────────────────────────
         elif scene_frame is not None:
-            # Show the latest captured scene frame with a label overlay
             scene_id = id(scene_frame)
             if not window_open:
                 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -166,37 +183,38 @@ def display_loop():
                 logger.info("Display: window opened for scene frame")
 
             if scene_id != _last_scene_id[0]:
-                # New frame arrived — render label overlay once
                 display = cv2.resize(scene_frame, (960, 540))
-
-                # Semi-transparent dark bar at the top for the label
                 overlay = display.copy()
                 cv2.rectangle(overlay, (0, 0), (960, 44), (0, 0, 0), -1)
                 cv2.addWeighted(overlay, 0.55, display, 0.45, 0, display)
-
                 cv2.putText(display, "Scene captured",
                             (14, 30), cv2.FONT_HERSHEY_SIMPLEX,
                             0.85, (255, 255, 255), 2, cv2.LINE_AA)
-
                 cv2.imshow(WINDOW_NAME, display)
                 _last_scene_id[0] = scene_id
 
+        # ── 4. Nothing running ───────────────────────────────────────────
         elif window_open:
-            # Something was running but has now stopped
             cv2.imshow(WINDOW_NAME, stopped)
 
-        # waitKey must be called continuously to keep Qt event loop alive
+        # ── waitKey keeps Qt event loop alive (must run continuously) ────
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q') and window_open:
-            logger.info("'q' pressed — stopping currency detection")
+            logger.info("'q' pressed — stopping active modules")
+            try:
+                import modules.navigation.navigation_module as _nav
+                if _nav.navigation_active:
+                    _nav.stop_navigation_mode()
+            except Exception as e:
+                logger.warning(f"q-press nav stop error: {e}")
             try:
                 from modules.currency.currency_module import stop_currency_mode, currency_active
                 if currency_active:
                     stop_currency_mode()
             except Exception as e:
-                logger.warning(f"q-press stop error: {e}")
+                logger.warning(f"q-press currency stop error: {e}")
 
-        time.sleep(0.033)   # ~30 Hz is plenty for display
+        time.sleep(0.033)   # ~30 Hz display update
 
 
 # ══════════════════════════════════════════════
@@ -209,18 +227,24 @@ if __name__ == "__main__":
     logger.info("    Press Ctrl+C to stop              ")
     logger.info("══════════════════════════════════════")
 
-    # Mic loop in background thread — blocks on listen() so must not be main
     mic_thread = threading.Thread(target=mic_loop, daemon=True, name="MicLoop")
     mic_thread.start()
     logger.info("Mic loop thread started")
 
     try:
-        # Main thread owns all cv2 GUI calls
         display_loop()
 
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt — shutting down")
         speaker.speak("Goodbye!")
+
+        # ── Stop all active modules cleanly ──────────────────────────────
+        try:
+            import modules.navigation.navigation_module as _nav
+            if _nav.navigation_active:
+                _nav.stop_navigation_mode()
+        except Exception:
+            pass
 
         try:
             from modules.currency.currency_module import stop_currency_mode, currency_active

@@ -23,11 +23,6 @@ llm = ChatGroq(
 
 
 # ── Routing Prompt ─────────────────────────────────────────────────────────────
-# Key additions vs previous version:
-#   • Explicit instruction to be sceptical of short/ambiguous/noisy transcripts.
-#   • Confidence guidance — only assign high confidence when the command is clear
-#     and unambiguous; assign low confidence for anything unclear or too short.
-#   • "unknown" is now an explicitly preferred fallback, not a last resort.
 ROUTING_PROMPT = """
 You are the routing brain of a voice assistant for visually impaired users in India.
 
@@ -44,9 +39,10 @@ Pick ONE mode from this list:
 
 Hints:
 - paisa, note, money, currency, kitne ka → currency_mode
-- stop, band karo, ruk jao, bas → stop_mode
+- stop, band karo, ruk jao, bas, stop navigation, stop navigating → stop_mode
 - read, padho, kya likha hai → reading_mode
 - surroundings, aas paas, bata kya hai, describe, surrounding → navigation_mode
+- activate navigation, navigation mode, start navigation, navigate, guide me, help me walk, blindnav, obstacle detection, proximity, path guide → navigation_mode
 - news, weather, time, who is, what is, information, update → knowledge_mode
 
 CONFIDENCE RULES — follow these strictly:
@@ -62,7 +58,7 @@ CONFIDENCE RULES — follow these strictly:
   with false high confidence. It is always safer to ask than to act on noise.
 
 IMPORTANT: Return ONLY a raw JSON object. No markdown. No code fences. No explanation.
-Example: {{"mode": "navigation_mode", "confidence": 0.92, "cleaned_text": "describe surroundings", "extra_context": ""}}
+Example: {{"mode": "navigation_mode", "confidence": 0.92, "cleaned_text": "activate navigation mode", "extra_context": ""}}
 """
 
 VALID_MODES = {
@@ -71,20 +67,16 @@ VALID_MODES = {
     "currency_mode",
     "stop_mode",
     "knowledge_mode",
-    "unknown"
+    "unknown",
 }
 
 # Modes that trigger hardware (camera, etc.) — held to a stricter confidence bar.
 _ACTION_MODES = {"navigation_mode", "reading_mode", "currency_mode"}
 
-# Minimum confidence required to execute an action mode.
-# Anything below this is downgraded to unknown before it reaches the router.
 _ACTION_MIN_CONFIDENCE  = 0.75
-_READING_MIN_CONFIDENCE = 0.85   # reading needs higher bar — most noise-triggered mode
-_READING_MIN_WORDS      = 3      # "read" alone is not enough to trigger camera
-
-# Minimum number of words a transcript must have before we bother routing it.
-_MIN_TRANSCRIPT_WORDS = 2
+_READING_MIN_CONFIDENCE = 0.85
+_READING_MIN_WORDS      = 3
+_MIN_TRANSCRIPT_WORDS   = 2
 
 
 # ── Safe JSON extractor ────────────────────────────────────────────────────────
@@ -100,31 +92,33 @@ def _parse_llm_json(raw: str) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 # CAMERA OWNERSHIP HELPER
 # ══════════════════════════════════════════════════════════════════════════════
-def _stop_currency_if_running() -> bool:
+def _stop_all_active_modes() -> None:
     """
-    Stop currency detection if active and wait for camera to be fully released.
-    Returns True if currency was stopped, False if it wasn't running.
+    Stop currency and/or navigation if either is running.
+    Waits for camera to be released before returning.
     """
+    # Stop navigation first (it also holds the camera)
+    try:
+        import modules.navigation.navigation_module as _nav
+        if _nav.navigation_active:
+            logger.info("Camera requested — stopping navigation first…")
+            _nav.stop_navigation_mode()
+            _nav._camera_released.wait(timeout=3.0)
+            logger.info("Navigation stopped, camera free ✓")
+    except Exception as e:
+        logger.error(f"_stop_all_active_modes (nav): {e}", exc_info=True)
+
+    # Stop currency
     try:
         import modules.currency.currency_module as _cm
         import modules.currency.currency_detector as _det
-
-        if not _cm.currency_active:
-            return False
-
-        logger.info("Camera requested by another module — stopping currency first...")
-        _cm.stop_currency_mode()
-
-        released = _det._camera_released.wait(timeout=2.0)
-        if not released:
-            logger.error("Camera still not released after stop — proceeding anyway")
-
-        logger.info("Currency stopped, camera free ✓")
-        return True
-
+        if _cm.currency_active:
+            logger.info("Camera requested — stopping currency first…")
+            _cm.stop_currency_mode()
+            _det._camera_released.wait(timeout=2.0)
+            logger.info("Currency stopped, camera free ✓")
     except Exception as e:
-        logger.error(f"_stop_currency_if_running failed: {e}", exc_info=True)
-        return False
+        logger.error(f"_stop_all_active_modes (currency): {e}", exc_info=True)
 
 
 # ═══════════════════════════════════════════════
@@ -147,11 +141,6 @@ def interpret_intent_node(state: AssistantState) -> AssistantState:
         logger.warning("Empty transcript — skipping LLM call")
         return fallback
 
-    # ── Pre-LLM noise gate ────────────────────────────────────────────────────
-    # Transcripts shorter than _MIN_TRANSCRIPT_WORDS almost certainly came from
-    # noise or a single accidental word. Skip the LLM entirely and treat as
-    # unknown — the user will hear a clarification question instead of a
-    # random module firing.
     word_count = len(transcript.strip().split())
     if word_count < _MIN_TRANSCRIPT_WORDS:
         logger.warning(
@@ -160,8 +149,6 @@ def interpret_intent_node(state: AssistantState) -> AssistantState:
         )
         return fallback
 
-    # Reading mode extra gate: require >= 3 words before even calling LLM.
-    # Catches noise like "read" or "please read" that LLM routes confidently.
     lower = transcript.lower().strip()
     looks_like_read = any(w in lower.split() for w in ("read", "padho", "reading"))
     if looks_like_read and word_count < _READING_MIN_WORDS:
@@ -189,10 +176,6 @@ def interpret_intent_node(state: AssistantState) -> AssistantState:
             logger.warning(f"Unexpected mode '{mode}' — falling back to unknown")
             mode = "unknown"
 
-        # ── Post-LLM action confidence gate ──────────────────────────────────
-        # Action modes touch hardware. If the LLM returned one but with
-        # confidence below the minimum, silently downgrade to unknown so the
-        # user is asked to confirm rather than the wrong module firing.
         min_conf = _READING_MIN_CONFIDENCE if mode == "reading_mode" else _ACTION_MIN_CONFIDENCE
         if mode in _ACTION_MODES and confidence < min_conf:
             logger.warning(
@@ -223,7 +206,6 @@ def interpret_intent_node(state: AssistantState) -> AssistantState:
 # NODE 2 — Confidence Router
 # ═══════════════════════════════════════════════
 def confidence_router_node(state: AssistantState) -> AssistantState:
-    # Never ask clarification questions — execute directly or stay silent.
     return {**state, "final_output": ""}
 
 
@@ -235,7 +217,7 @@ def route_to_module(state: AssistantState) -> str:
         return "tts_node"
 
     routes = {
-        "navigation_mode": "scene_node",
+        "navigation_mode": "navigation_node",
         "reading_mode":    "reading_node",
         "currency_mode":   "currency_node",
         "stop_mode":       "stop_node",
@@ -245,14 +227,45 @@ def route_to_module(state: AssistantState) -> str:
 
 
 # ═══════════════════════════════════════════════
-# NODE 3a — Scene
+# NODE 3a — Navigation  ← NEW
+# ═══════════════════════════════════════════════
+def navigation_node(state: AssistantState) -> AssistantState:
+    from modules.navigation.navigation_module import (
+        start_navigation_mode, navigation_active
+    )
+    from tts.speaker import Speaker
+    logger.info("Executing Navigation module")
+
+    if navigation_active:
+        logger.info("Navigation already active — skipping duplicate start")
+        return {**state, "final_output": ""}
+
+    # Release any other mode that may hold the camera
+    _stop_all_active_modes()
+
+    sp = Speaker()
+    sp.speak("Activating navigation mode. I will guide you.")
+
+    try:
+        start_navigation_mode(speaker=sp)
+        result = "Navigation mode on."
+    except Exception as e:
+        logger.error(f"Navigation module error: {e}", exc_info=True)
+        result = "I could not start navigation mode."
+        sp.speak(result)
+
+    return {**state, "final_output": result, "spoken": True}
+
+
+# ═══════════════════════════════════════════════
+# NODE 3b — Scene  (kept for backward compat)
 # ═══════════════════════════════════════════════
 def scene_node(state: AssistantState) -> AssistantState:
     from modules.scene.scene_module import SceneModule
     from tts.speaker import Speaker
     logger.info("Executing Scene module")
 
-    _stop_currency_if_running()
+    _stop_all_active_modes()
 
     sp = Speaker()
     sp.speak_stream("Looking at your surroundings.")
@@ -268,14 +281,14 @@ def scene_node(state: AssistantState) -> AssistantState:
 
 
 # ═══════════════════════════════════════════════
-# NODE 3b — Reading
+# NODE 3c — Reading
 # ═══════════════════════════════════════════════
 def reading_node(state: AssistantState) -> AssistantState:
     from modules.reading.reading_module import ReadingModule
     from tts.speaker import Speaker
     logger.info("Executing Reading module")
 
-    _stop_currency_if_running()
+    _stop_all_active_modes()
 
     sp = Speaker()
     sp.speak_stream("Reading now.")
@@ -291,7 +304,7 @@ def reading_node(state: AssistantState) -> AssistantState:
 
 
 # ═══════════════════════════════════════════════
-# NODE 3c — Currency
+# NODE 3d — Currency
 # ═══════════════════════════════════════════════
 def currency_node(state: AssistantState) -> AssistantState:
     from modules.currency.currency_module import start_currency_mode, currency_active
@@ -302,6 +315,7 @@ def currency_node(state: AssistantState) -> AssistantState:
             logger.info("Currency already active — skipping duplicate start")
             return {**state, "final_output": ""}
 
+        _stop_all_active_modes()
         start_currency_mode()
         result = "Currency mode on."
 
@@ -313,29 +327,37 @@ def currency_node(state: AssistantState) -> AssistantState:
 
 
 # ═══════════════════════════════════════════════
-# NODE 3d — Stop
+# NODE 3e — Stop
 # ═══════════════════════════════════════════════
 def stop_node(state: AssistantState) -> AssistantState:
-    from modules.currency.currency_module import stop_currency_mode, currency_active
     logger.info("Stopping active modules")
 
+    stopped_something = False
+
     try:
-        if not currency_active:
-            logger.info("Nothing active to stop")
-            return {**state, "final_output": ""}
-
-        stop_currency_mode()
-        result = "Stopped."
-
+        import modules.navigation.navigation_module as _nav
+        if _nav.navigation_active:
+            _nav.stop_navigation_mode()
+            stopped_something = True
+            logger.info("Navigation stopped via stop_node")
     except Exception as e:
-        logger.error(f"Stop error: {e}", exc_info=True)
-        result = "Could not stop."
+        logger.error(f"stop_node (nav): {e}", exc_info=True)
 
+    try:
+        from modules.currency.currency_module import stop_currency_mode, currency_active
+        if currency_active:
+            stop_currency_mode()
+            stopped_something = True
+            logger.info("Currency stopped via stop_node")
+    except Exception as e:
+        logger.error(f"stop_node (currency): {e}", exc_info=True)
+
+    result = "Stopped." if stopped_something else ""
     return {**state, "final_output": result}
 
 
 # ═══════════════════════════════════════════════
-# NODE 3e — Knowledge
+# NODE 3f — Knowledge
 # ═══════════════════════════════════════════════
 def knowledge_node(state: AssistantState) -> AssistantState:
     from modules.knowledge.knowledge_logic import handle_knowledge_query
@@ -375,6 +397,7 @@ def build_agent():
 
     graph.add_node("interpret_intent",  interpret_intent_node)
     graph.add_node("confidence_router", confidence_router_node)
+    graph.add_node("navigation_node",   navigation_node)      # ← NEW
     graph.add_node("scene_node",        scene_node)
     graph.add_node("reading_node",      reading_node)
     graph.add_node("currency_node",     currency_node)
@@ -389,20 +412,22 @@ def build_agent():
         "confidence_router",
         route_to_module,
         {
-            "scene_node":     "scene_node",
-            "reading_node":   "reading_node",
-            "currency_node":  "currency_node",
-            "stop_node":      "stop_node",
-            "knowledge_node": "knowledge_node",
-            "tts_node":       "tts_node",
+            "navigation_node": "navigation_node",   # ← NEW
+            "scene_node":      "scene_node",
+            "reading_node":    "reading_node",
+            "currency_node":   "currency_node",
+            "stop_node":       "stop_node",
+            "knowledge_node":  "knowledge_node",
+            "tts_node":        "tts_node",
         }
     )
 
-    graph.add_edge("scene_node",     "tts_node")
-    graph.add_edge("reading_node",   "tts_node")
-    graph.add_edge("currency_node",  "tts_node")
-    graph.add_edge("stop_node",      "tts_node")
-    graph.add_edge("knowledge_node", "tts_node")
+    graph.add_edge("navigation_node", "tts_node")   # ← NEW
+    graph.add_edge("scene_node",      "tts_node")
+    graph.add_edge("reading_node",    "tts_node")
+    graph.add_edge("currency_node",   "tts_node")
+    graph.add_edge("stop_node",       "tts_node")
+    graph.add_edge("knowledge_node",  "tts_node")
     graph.add_edge("tts_node", END)
 
     return graph.compile()
