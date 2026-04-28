@@ -63,29 +63,34 @@ def _get_speaker():
         return _speaker
 
 
+_last_speak_time = 0.0
+REPEAT_INTERVAL  = 2.5  # seconds
+STABLE_FRAMES    = 7    # frames required to confirm a label change (~230ms)
+
+_candidate_label   = None
+_candidate_counter = 0
+
 # ── Public API (called from currency_detector.py every frame) ────────────────
 
 def process_confirmed_notes(confirmed: list) -> None:
     """
     Called every detection frame (30+ fps).  Must be non-blocking.
-
-    Behaviour:
-    • confirmed non-empty, new label     → speak (enqueue)
-    • confirmed non-empty, same label    → do nothing
-    • confirmed non-empty, changed label → interrupt + speak
-    • confirmed empty, < GONE_FRAMES     → do nothing (tolerate gap)
-    • confirmed empty, >= GONE_FRAMES    → reset state (note truly gone)
     """
-    global _current_label, _gone_counter
+    global _current_label, _gone_counter, _last_speak_time
+    global _candidate_label, _candidate_counter
 
     with _state_lock:
         if confirmed:
             _gone_counter = 0
             label = _summarise_label([t["confirmed_cls"] for t in confirmed])
+            now = time.time()
 
             if _current_label is None:
-                # Transition IDLE → ANNOUNCED — first detection
+                # Transition IDLE → ANNOUNCED — first detection (instant)
                 _current_label = label
+                _candidate_label = label
+                _candidate_counter = 0
+                _last_speak_time = now
                 msg = _build_message_from_label(label)
                 logger.info(f"currency_logic: DETECTED → '{msg}'")
                 speaker = _get_speaker()
@@ -93,30 +98,47 @@ def process_confirmed_notes(confirmed: list) -> None:
                     speaker.speak(msg)
 
             elif label != _current_label:
-                # Label CHANGED — interrupt old, speak new
-                _current_label = label
-                msg = _build_message_from_label(label)
-                logger.info(f"currency_logic: CHANGED → '{msg}'")
-                speaker = _get_speaker()
-                if speaker:
-                    speaker.interrupt_and_speak(msg)
+                # Potential label change — require STABLE_FRAMES consecutive
+                # matches to prevent YOLO 1-frame hallucinations from stuttering speech.
+                if label == _candidate_label:
+                    _candidate_counter += 1
+                    if _candidate_counter >= STABLE_FRAMES:
+                        _current_label = label
+                        _last_speak_time = now
+                        msg = _build_message_from_label(label)
+                        logger.info(f"currency_logic: CHANGED → '{msg}'")
+                        speaker = _get_speaker()
+                        if speaker:
+                            speaker.interrupt_and_speak(msg)
+                else:
+                    _candidate_label = label
+                    _candidate_counter = 1
 
-            # else: same label, still visible — do nothing (no repeat)
+            else:
+                # same label, still visible — reset candidate & repeat every interval
+                _candidate_label = label
+                _candidate_counter = 0
+                if now - _last_speak_time >= REPEAT_INTERVAL:
+                    _last_speak_time = now
+                    msg = _build_message_from_label(label)
+                    logger.info(f"currency_logic: REPEATED → '{msg}'")
+                    speaker = _get_speaker()
+                    if speaker:
+                        speaker.speak(msg)
 
         else:
             # No note this frame
             if _current_label is not None:
                 _gone_counter += 1
                 if _gone_counter >= GONE_FRAMES:
-                    # Note truly gone — reset to IDLE
+                    # Note truly gone — reset to IDLE.
+                    # We let any currently playing announcement finish naturally
+                    # rather than cutting it off mid-sentence.
                     logger.info(
                         f"currency_logic: GONE after {_gone_counter} frames "
                         f"(was '{_current_label}')"
                     )
                     _current_label = None
-                    # Don't forcibly stop audio — let the last announcement
-                    # finish naturally.  The user heard the correct denomination,
-                    # cutting it mid-word is worse than letting it complete.
 
 
 def reset_logic_state():

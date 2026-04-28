@@ -258,7 +258,7 @@ def _speak_piper(text: str, interrupt_flag: threading.Event | None = None) -> No
             # Write in ~100ms chunks so interrupt_and_speak() can cut
             # playback within 100ms instead of blocking for the full
             # audio duration (could be 1-2 seconds).
-            CHUNK = int(PLAY_RATE * 0.1)   # 4410 samples = ~100ms
+            CHUNK = int(PLAY_RATE * 0.04)   # ~40ms (minimizes buffer trailing)
             for i in range(0, len(full_audio), CHUNK):
                 if interrupt_flag and interrupt_flag.is_set():
                     logger.debug("_speak_piper: interrupted during playback")
@@ -530,25 +530,11 @@ class _TTSWorker:
                 self._announcement_q.get_nowait()
             except queue.Empty:
                 break
-        # Stop piper keepalive stream playback in-flight
-        # NOTE: sd.stop() only stops the DEFAULT stream (sd.play).
-        # Piper uses a dedicated _keepalive_stream — we must stop THAT too.
-        try:
-            global _keepalive_stream
-            with _keepalive_lock:
-                if _keepalive_stream is not None and _keepalive_stream.active:
-                    _keepalive_stream.abort()
-                    _keepalive_stream.close()
-                    _keepalive_stream = None
-                    # Reopen immediately so next speech works
-                    # (will be reopened by _start_keepalive on next speak)
-        except Exception:
-            pass
-        try:
-            import sounddevice as sd
-            sd.stop()
-        except Exception:
-            pass
+        # The worker thread loops (e.g. in _play_cached_pcm) already check
+        # self._interrupt_flag every 100ms and return early safely.
+        # DO NOT call sd.stop() or _keepalive_stream.abort() here, as
+        # violently aborting ALSA streams from another thread causes
+        # 'malloc(): unaligned tcache chunk detected' crashes on Pi.
         # Stop pygame playback in-flight
         try:
             import pygame
@@ -699,6 +685,9 @@ class _TTSWorker:
             _time.sleep(0.02)
 
     def _synthesise_and_play(self, text: str):
+        if not text or not text.strip():
+            return
+
         # Skip if an interrupt arrived (stale message)
         if self._interrupt_flag.is_set():
             self._interrupt_flag.clear()
@@ -848,7 +837,7 @@ def _play_cached_pcm(pcm, interrupt_flag=None):
             _t.sleep(0.05)
         return
 
-    CHUNK = int(_KEEPALIVE_RATE * 0.1)   # ~100ms
+    CHUNK = int(_KEEPALIVE_RATE * 0.04)   # ~40ms (minimizes buffer trailing)
     for i in range(0, len(pcm), CHUNK):
         if interrupt_flag and interrupt_flag.is_set():
             return
@@ -925,9 +914,13 @@ class Speaker:
         """
         Stop whatever is currently playing and speak this text immediately.
         Use for real-time currency updates — ensures stale audio never plays.
+        If text is empty, it just stops playback.
         """
         if not text or not text.strip():
+            logger.info("Interrupt-speak: <stop audio>")
+            _get_worker().interrupt_announcement("")
             return
+            
         preview = text[:70] + "..." if len(text) > 70 else text
         logger.info(f"Interrupt-speak: '{preview}'")
         _get_worker().interrupt_announcement(text)
