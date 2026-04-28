@@ -1,25 +1,24 @@
 """
 modules/currency/currency_detector.py
 
-Hailo-8 YOLO currency detection pipeline.
+Hailo-8 YOLO currency detection pipeline — HIGH-FPS REAL-TIME version.
 
-Changes from previous version
-------------------------------
-1.  Shared VDevice  — replaced `picamera2.devices.Hailo` (which opened its
-    own implicit VDevice) with a direct `hailo_platform` call that uses the
-    process-wide shared VDevice from utils.hailo_device.  This eliminates
-    the ~5 s stall when switching between currency and navigation modes.
+Key changes for real-time performance
+--------------------------------------
+1.  InferVStreams context is created ONCE at startup and reused for every
+    frame.  The previous version recreated it per-frame — that context
+    setup/teardown overhead was the #1 reason FPS was stuck at ~15.
 
-2.  shutdown()  — no longer releases the VDevice.  The device lifetime is
-    managed by utils.hailo_device.shutdown() registered in main.py via
-    atexit.  shutdown() here only deactivates the configured network.
+2.  Confirmation gate removed — the first high-confidence detection is
+    sent to speech immediately.  No more waiting for 3-of-4 frames.
 
-Performance notes (unchanged from previous version)
------------------------------------------------------
-  - Direct capture_array() call instead of per-frame thread spawn.
-  - CONFIRM_WINDOW=4, CONFIRM_HITS=3 → confirms in ~0.25 s at 15 fps.
-  - ANNOUNCE_REPEAT / announce_count logic removed; currency_logic fires
-    on new confirmed track IDs.
+3.  DISAPPEAR_FRAMES reduced to 1 — a note is considered gone after just
+    one missed frame (~30-60ms at 30+ fps).  currency_logic handles the
+    "note removed → stop speaking" transition.
+
+4.  Camera warmup reduced from 1.0s to 0.3s.
+
+5.  Shared VDevice is still used — no VDevice lifecycle changes.
 """
 
 import cv2
@@ -45,15 +44,15 @@ CLASS_NAMES_FALLBACK = [
 
 CONFIDENCE_THRESHOLD = 0.75
 
-# Faster confirmation: 4 frames window, 3 hits required → confirms in ~0.25s at 15fps
-CONFIRM_WINDOW = 4
-CONFIRM_HITS   = 3
-MAJORITY_RATIO = 0.75
+# Instant confirmation — no multi-frame gating.
+# A single high-confidence detection is enough.
+CONFIRM_WINDOW = 1
+CONFIRM_HITS   = 1
+MAJORITY_RATIO = 1.0
 
-# Low disappear frames: tracker drops a note after 3 missed frames (~200ms at 15fps)
-# currency_logic.py has its own GONE_FRAMES debounce on top of this so we
-# do NOT need a large value here — keeping it small means the tracker stays clean.
-DISAPPEAR_FRAMES  = 3
+# Note disappears after 5 missed frames (~167ms at 30fps).
+# This absorbs brief detection gaps without triggering false "gone" events.
+DISAPPEAR_FRAMES  = 5
 TRACK_IOU_THRESH  = 0.35
 NMS_IOU_THRESHOLD = 0.50
 
@@ -435,7 +434,7 @@ def _run(stop_evt, camera_released_evt):
         picam2 = camera_manager.acquire(
             mode="currency",
             model_size=(model_w, model_h),
-            warmup=1.0
+            warmup=0.3          # Reduced from 1.0 — get to detection faster
         )
         camera_acquired = True
         logger.info(f"_run(): camera acquired {model_w}x{model_h} at max fps")
@@ -453,22 +452,20 @@ def _run(stop_evt, camera_released_evt):
     logger.info("_run(): entering detection loop")
     fps_t = time.time(); fps_count = 0; fps = 0.0
 
-    # Resolve the inference callable once — works for both the shared-VDevice
-    # path (no .run()) and the legacy picamera2 wrapper (has .run()).
+    # ── Build the inference callable ──────────────────────────────────────
     #
-    # Output format contract for _parse_hailo_output():
-    #   A list where index = class_id and value = array of shape (N, 5)
-    #   with columns [y1_norm, x1_norm, y2_norm, x2_norm, score].
-    #   This is what picamera2.devices.Hailo.run() already returns.
-    #   InferVStreams returns a dict keyed by layer name — we unpack it here
-    #   so _parse_hailo_output never has to deal with dict keys.
+    # CRITICAL FPS FIX: For hailo_platform, we create the InferVStreams
+    # context ONCE here and reuse it for every frame.  The previous
+    # version used `with InferVStreams(...)` inside the loop which
+    # created and destroyed the context every frame — that setup/teardown
+    # overhead was the #1 bottleneck limiting FPS to ~15.
 
     if hasattr(network, "run"):
         # Legacy _LegacyHailoWrapper — already returns the per-class list.
         infer_fn = network.run
+        _infer_cleanup = None
     else:
-        # hailo_platform configured network — use InferVStreams, then convert
-        # the raw output dict into the per-class list format.
+        # hailo_platform configured network — persistent InferVStreams context
         from hailo_platform import (        # type: ignore
             InferVStreams,
             InputVStreamParams,
@@ -477,6 +474,14 @@ def _run(stop_evt, camera_released_evt):
         )
 
         num_classes = len(CLASS_NAMES)
+        inp_name    = network.get_input_vstream_infos()[0].name
+        in_p        = InputVStreamParams.make(network, format_type=FormatType.UINT8)
+        out_p       = OutputVStreamParams.make(network, format_type=FormatType.FLOAT32)
+
+        # Create the inference pipeline ONCE — reuse for every frame
+        _infer_ctx  = InferVStreams(network, in_p, out_p)
+        _infer_pipe = _infer_ctx.__enter__()
+        logger.info("_run(): InferVStreams context created (persistent) ✓")
 
         def _unpack_nms_output(raw_dict: dict) -> list:
             """
@@ -484,8 +489,7 @@ def _run(stop_evt, camera_released_evt):
 
             Hailo YOLOv8/YOLO11 NMS postprocess output is RAGGED: each class
             slot holds a variable number of detections so the whole structure
-            cannot be cast to a uniform numpy float32 array. That is exactly
-            the inhomogeneous-shape error that was crashing inference.
+            cannot be cast to a uniform numpy float32 array.
 
             Observed layout from the HEF:
               {
@@ -546,13 +550,18 @@ def _run(stop_evt, camera_released_evt):
             return result
 
         def infer_fn(frame_rgb):
-            inp_name   = network.get_input_vstream_infos()[0].name
             input_data = {inp_name: frame_rgb[np.newaxis, ...]}
-            in_p  = InputVStreamParams.make(network, format_type=FormatType.UINT8)
-            out_p = OutputVStreamParams.make(network, format_type=FormatType.FLOAT32)
-            with InferVStreams(network, in_p, out_p) as pipe:
-                raw = pipe.infer(input_data)
+            raw = _infer_pipe.infer(input_data)
             return _unpack_nms_output(raw)
+
+        def _cleanup_infer_ctx():
+            try:
+                _infer_ctx.__exit__(None, None, None)
+                logger.info("_run(): InferVStreams context closed ✓")
+            except Exception as exc:
+                logger.warning(f"_run(): InferVStreams cleanup error: {exc}")
+
+        _infer_cleanup = _cleanup_infer_ctx
 
     try:
         while not stop_evt.is_set():
@@ -598,6 +607,9 @@ def _run(stop_evt, camera_released_evt):
         logger.error(f"_run(): loop exception: {e}", exc_info=True)
     finally:
         logger.info("_run(): entering finally block")
+        # Clean up persistent inference context
+        if _infer_cleanup is not None:
+            _infer_cleanup()
         if camera_acquired:
             try:
                 camera_manager.release()

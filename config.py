@@ -30,21 +30,13 @@ VLM_MAX_TOKENS      = 300        # slightly higher to allow complete sentences
 CAMERA_INDEX        = 0
 CAMERA_WARMUP_MS    = 500
 
-# ── TTS ───────────────────────────────────────────────────────────────────────
 # Options:
-#   "pyttsx3"    — offline, zero-latency (espeak-ng on Pi). Recommended.
-#                  Install: pip install pyttsx3 && sudo apt install espeak-ng
-#   "gtts"       — Google TTS, online, saves to disk first (~1-3s extra)
-#   "elevenlabs" — highest quality, requires API key
-# Options:
-#   "piper"      — RECOMMENDED. Offline neural TTS, <200ms latency, natural voice.
+#   "gtts"       — edge-tts (RECOMMENDED). Neural voice with instant response via cache.
+#   "piper"      — Offline neural TTS, <200ms latency, lower quality.
 #                  pip install piper-tts
-#                  Download voice: en_US-lessac-medium.onnx + .onnx.json
-#                  https://github.com/rhasspy/piper/blob/master/VOICES.md
-#   "gtts"       — Google Translate TTS, online, ~1-2s network delay per call
 #   "pyttsx3"    — espeak-ng, offline, robotic
 #   "elevenlabs" — highest quality, requires API key
-TTS_ENGINE          = "gtts"     # "gtts" now uses edge-tts (Microsoft neural) under the hood
+TTS_ENGINE          = "gtts"
 TTS_LANGUAGE        = "en"
 TTS_SLOW            = False
 
@@ -61,8 +53,14 @@ EDGE_TTS_RATE       = "-10%"
 # Piper settings (only used when TTS_ENGINE = "piper")
 # Path to the .onnx model file. Download from:
 # https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_US/lessac/medium
-PIPER_MODEL         = "/home/linux/piper-voices/en_US-lessac-medium.onnx"
-PIPER_LENGTH_SCALE  = 1.15       # slightly slower — more natural cadence        # speech speed: >1.0 = slower, <1.0 = faster
+# Female voice: en_US-amy-medium  (download if missing — see instructions below)
+# Male voice:   en_US-lessac-medium (fallback)
+# Download amy voice:
+#   cd /home/linux/piper-voices
+#   wget -O en_US-amy-medium.onnx 'https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/amy/medium/en_US-amy-medium.onnx?download=true'
+#   wget -O en_US-amy-medium.onnx.json 'https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/amy/medium/en_US-amy-medium.onnx.json?download=true'
+PIPER_MODEL         = "/home/linux/piper-voices/en_US-amy-medium.onnx"
+PIPER_LENGTH_SCALE  = 1.0        # normal speed for maximum responsiveness
 
 # pyttsx3 settings (only used when TTS_ENGINE = "pyttsx3")
 PYTTSX3_RATE        = 165        # words per minute — lower = slower/clearer

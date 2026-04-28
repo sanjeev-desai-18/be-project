@@ -63,7 +63,10 @@ class CameraManager:
             w, h = model_size
             config = cam.create_preview_configuration(
                 main={"size": (w, h), "format": "RGB888"},
-                transform=flip)
+                transform=flip,
+                # Force 30fps — without this, auto-exposure may slow the
+                # frame rate.  33333µs = 30fps.
+                controls={"FrameDurationLimits": (33333, 33333)})
 
         elif mode == "navigation":
             # 640×480 preview at ~30 fps — enough for real-time depth + YOLO.

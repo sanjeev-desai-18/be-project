@@ -1,30 +1,28 @@
 """
 modules/currency/currency_logic.py
 
-Detection → Speech pipeline with parallel execution.
+Detection → Speech pipeline — ROBUST REAL-TIME version.
 
 Architecture
 ────────────
-Detection loop (15 fps)
-    │  puts label string into a single-slot "latest-wins" queue
+Detection loop (30+ fps)
+    │  calls process_confirmed_notes() every frame — always non-blocking
     ▼
-_SpeechWorker thread  (runs independently, never blocks detection)
-    │  pulls the latest label, speaks it, then waits for REPEAT_DELAY
-    ▼
-Speaker.speak()  (non-blocking TTS enqueue)
+Simple state machine:
+    IDLE  → note detected   → speak() → ANNOUNCED
+    ANNOUNCED → same note   → do nothing
+    ANNOUNCED → diff note   → interrupt_and_speak() → ANNOUNCED (new label)
+    ANNOUNCED → gone N frames → IDLE  (let speech finish naturally)
+    IDLE  → same note back  → speak() → ANNOUNCED
 
 Key properties
 ──────────────
-• Detection thread is NEVER blocked by TTS synthesis or playback.
-• Only the *most recent* confirmed label is spoken — stale labels are
-  automatically overwritten in the single-slot queue before they play.
-• Once the worker finishes speaking, it immediately checks for the
-  latest enqueued label (no artificial sleep between detections).
-• REPEAT_DELAY prevents re-announcing the same note every frame while
-  still re-announcing if the note changes or disappears and reappears.
-• "No note" is handled by a GONE_DEBOUNCE: the worker only announces
-  silence after the note has been absent for that many seconds, avoiding
-  spurious "gone" announcements from brief tracking gaps.
+• Speaks ONCE when a note first appears.
+• Does NOT repeat while the same note stays in view.
+• When the note CHANGES: interrupts old speech, speaks new immediately.
+• When the note LEAVES: state resets after a generous debounce (~1s)
+  so brief detection gaps don't cause speech to break/restart.
+• NO cooldown timers — new note = instant speech.
 """
 
 import threading
@@ -34,144 +32,16 @@ from utils.logger import logger
 
 # ── Tuning constants ──────────────────────────────────────────────────────────
 
-# Minimum seconds before the *same* label is spoken again.
-# Lower  = more responsive to holds; Higher = less repetitive.
-REPEAT_DELAY = 3.0
+# How many consecutive "no note" frames before we consider the note truly gone.
+# At 30 fps → 30 frames = 1 second.  This is generous enough to ride out
+# intermittent YOLO detection gaps without causing speech break/restart cycles.
+GONE_FRAMES = 30
 
-# How many seconds a note must be continuously absent before the worker
-# considers it gone and resets its "last spoken" memory.
-GONE_DEBOUNCE = 1.5
+# ── State variables (protected by _state_lock) ───────────────────────────────
 
-# ── Single-slot "latest-wins" queue ──────────────────────────────────────────
-
-class _LatestQueue:
-    """
-    Thread-safe, single-slot queue.  put() always overwrites the stored
-    value so the consumer always sees the most-recent item.
-    get_nowait() returns the stored value (and clears it) or None.
-    """
-    def __init__(self):
-        self._lock  = threading.Lock()
-        self._value = None          # None means "nothing new"
-
-    def put(self, value):
-        with self._lock:
-            self._value = value
-
-    def get_nowait(self):
-        with self._lock:
-            v, self._value = self._value, None
-            return v
-
-    def clear(self):
-        with self._lock:
-            self._value = None
-
-
-_latest_label: _LatestQueue = _LatestQueue()
-
-
-# ── Speech worker ─────────────────────────────────────────────────────────────
-
-class _SpeechWorker:
-    """
-    Dedicated thread that consumes _latest_label and drives the TTS speaker.
-
-    State machine
-    ─────────────
-    _last_spoken_label  : label spoken most recently (None = nothing yet)
-    _last_spoken_time   : wall-clock time of that speak() call
-    _last_seen_time     : last time a non-None label arrived from detection
-    """
-
-    _POLL_INTERVAL = 0.05   # 50 ms poll — low CPU, still very responsive
-
-    def __init__(self):
-        self._last_spoken_label: str | None = None
-        self._last_spoken_time:  float      = 0.0
-        self._last_seen_time:    float      = 0.0
-
-        self._stop_evt = threading.Event()
-        self._thread   = threading.Thread(
-            target=self._run, daemon=True, name="currency-speech-worker"
-        )
-        self._thread.start()
-        logger.info("_SpeechWorker: started ✓")
-
-    # ── public ────────────────────────────────────────────────────────────────
-
-    def enqueue(self, label: str | None):
-        """Called from the detection thread.  Always non-blocking."""
-        _latest_label.put(label)
-
-    def stop(self):
-        self._stop_evt.set()
-        self._thread.join(timeout=3.0)
-
-    def reset(self):
-        _latest_label.clear()
-        self._last_spoken_label = None
-        self._last_spoken_time  = 0.0
-        self._last_seen_time    = 0.0
-        logger.info("_SpeechWorker: state reset")
-
-    # ── worker loop ───────────────────────────────────────────────────────────
-
-    def _run(self):
-        speaker = _get_speaker()
-
-        while not self._stop_evt.is_set():
-            label = _latest_label.get_nowait()
-            now   = time.monotonic()
-
-            if label is not None:
-                # Detection is alive and has a confirmed note
-                self._last_seen_time = now
-                self._maybe_speak(label, now, speaker)
-
-            else:
-                # No confirmed note in this slot — check gone debounce
-                if (self._last_spoken_label is not None
-                        and (now - self._last_seen_time) >= GONE_DEBOUNCE):
-                    # Note has been absent long enough — reset memory so
-                    # the same denomination will be announced fresh when
-                    # it reappears.
-                    logger.debug(
-                        f"_SpeechWorker: '{self._last_spoken_label}' gone "
-                        f"after {now - self._last_seen_time:.1f}s — resetting memory"
-                    )
-                    self._last_spoken_label = None
-                    self._last_spoken_time  = 0.0
-
-            self._stop_evt.wait(self._POLL_INTERVAL)
-
-    def _maybe_speak(self, label: str, now: float, speaker):
-        """
-        Decide whether to speak *label* right now.
-
-        Speak if:
-          (a) label changed from last spoken, OR
-          (b) same label but REPEAT_DELAY has elapsed (user still holding it)
-        """
-        same_label    = (label == self._last_spoken_label)
-        time_elapsed  = (now - self._last_spoken_time) >= REPEAT_DELAY
-
-        if same_label and not time_elapsed:
-            return  # Too soon — skip
-
-        msg = _build_message_from_label(label)
-        logger.info(
-            f"_SpeechWorker: speaking '{msg}' "
-            f"({'repeat' if same_label else 'new label'})"
-        )
-
-        self._last_spoken_label = label
-        self._last_spoken_time  = now
-
-        if speaker:
-            speaker.speak(msg)
-        else:
-            logger.warning(f"_SpeechWorker: [NO TTS] {msg}")
+_state_lock     = threading.Lock()
+_current_label  = None   # label key currently announced / None if idle
+_gone_counter   = 0      # consecutive frames with no detection
 
 
 # ── Speaker singleton ─────────────────────────────────────────────────────────
@@ -193,45 +63,68 @@ def _get_speaker():
         return _speaker
 
 
-# ── Worker singleton ──────────────────────────────────────────────────────────
-
-_worker: _SpeechWorker | None = None
-_worker_lock = threading.Lock()
-
-
-def _get_worker() -> _SpeechWorker:
-    global _worker
-    with _worker_lock:
-        if _worker is None:
-            _worker = _SpeechWorker()
-        return _worker
-
-
-# ── Public API (called from currency_detector.py) ────────────────────────────
+# ── Public API (called from currency_detector.py every frame) ────────────────
 
 def process_confirmed_notes(confirmed: list) -> None:
     """
-    Called every detection frame.  Non-blocking — just enqueues the latest
-    label into the single-slot queue and returns immediately.
+    Called every detection frame (30+ fps).  Must be non-blocking.
 
-    The _SpeechWorker thread handles rate-limiting and TTS in parallel.
+    Behaviour:
+    • confirmed non-empty, new label     → speak (enqueue)
+    • confirmed non-empty, same label    → do nothing
+    • confirmed non-empty, changed label → interrupt + speak
+    • confirmed empty, < GONE_FRAMES     → do nothing (tolerate gap)
+    • confirmed empty, >= GONE_FRAMES    → reset state (note truly gone)
     """
-    if confirmed:
-        label = _summarise_label([t["confirmed_cls"] for t in confirmed])
-        _get_worker().enqueue(label)
-    else:
-        # Signal "nothing visible" so the worker can run gone-debounce logic
-        _get_worker().enqueue(None)
+    global _current_label, _gone_counter
+
+    with _state_lock:
+        if confirmed:
+            _gone_counter = 0
+            label = _summarise_label([t["confirmed_cls"] for t in confirmed])
+
+            if _current_label is None:
+                # Transition IDLE → ANNOUNCED — first detection
+                _current_label = label
+                msg = _build_message_from_label(label)
+                logger.info(f"currency_logic: DETECTED → '{msg}'")
+                speaker = _get_speaker()
+                if speaker:
+                    speaker.speak(msg)
+
+            elif label != _current_label:
+                # Label CHANGED — interrupt old, speak new
+                _current_label = label
+                msg = _build_message_from_label(label)
+                logger.info(f"currency_logic: CHANGED → '{msg}'")
+                speaker = _get_speaker()
+                if speaker:
+                    speaker.interrupt_and_speak(msg)
+
+            # else: same label, still visible — do nothing (no repeat)
+
+        else:
+            # No note this frame
+            if _current_label is not None:
+                _gone_counter += 1
+                if _gone_counter >= GONE_FRAMES:
+                    # Note truly gone — reset to IDLE
+                    logger.info(
+                        f"currency_logic: GONE after {_gone_counter} frames "
+                        f"(was '{_current_label}')"
+                    )
+                    _current_label = None
+                    # Don't forcibly stop audio — let the last announcement
+                    # finish naturally.  The user heard the correct denomination,
+                    # cutting it mid-word is worse than letting it complete.
 
 
 def reset_logic_state():
     """Called by currency_detector.reset() when currency mode stops."""
-    global _worker
-    with _worker_lock:
-        if _worker is not None:
-            _worker.stop()
-            _worker = None
-    _latest_label.clear()
+    global _current_label, _gone_counter
+    with _state_lock:
+        _current_label = None
+        _gone_counter  = 0
     logger.info("currency_logic: state reset ✓")
 
 
@@ -255,7 +148,7 @@ def _label(cls: str) -> str:
 def _summarise_label(classes: list) -> str:
     """
     Build a stable string key from the list of confirmed class names.
-    Used as the identity token for change-detection in _SpeechWorker.
+    Used as the identity token for change-detection.
     e.g. ["500_rupees", "100_rupees"] → "100_rupees|500_rupees"
     """
     return "|".join(sorted(classes))
@@ -273,16 +166,16 @@ def _build_message(classes: list) -> str:
 
     phrases = []
     for denom, qty in items:
-        phrases.append(f"a {denom}" if qty == 1 else f"{qty} {denom}")
+        if qty == 1:
+            phrases.append(f"a {denom} note")
+        else:
+            phrases.append(f"{qty} {denom} notes")
 
     if len(phrases) == 1:
-        note_phrase = phrases[0]
+        body = phrases[0]
     elif len(phrases) == 2:
-        note_phrase = f"{phrases[0]} and {phrases[1]}"
+        body = f"{phrases[0]} and {phrases[1]}"
     else:
-        note_phrase = ", ".join(phrases[:-1]) + f", and {phrases[-1]}"
+        body = ", ".join(phrases[:-1]) + f", and {phrases[-1]}"
 
-    total = sum(counts.values())
-    noun  = "notes" if total > 1 else "note"
-
-    return f"I can see {note_phrase} {noun}."
+    return f"I can see {body}."
