@@ -4,6 +4,7 @@ main.py — Blind Assistant entry point for Raspberry Pi 5 + Hailo 8 AI HAT
 
 import sys
 import os
+import atexit
 import warnings
 import time
 import threading
@@ -23,6 +24,19 @@ from tts.speaker import Speaker
 from modules.stt.listener import listen
 from core.agent import agent
 from core.state import AssistantState
+
+# ── Register shared Hailo VDevice shutdown at process exit ──────────────────
+# This must be registered BEFORE any module opens the VDevice so it is
+# guaranteed to run last (atexit handlers execute in LIFO order).
+# All runners (depth, YOLO, currency) only deactivate their networks on
+# close(); the actual PCIe device handle is released here, once, cleanly.
+try:
+    from utils.hailo_device import shutdown as _hailo_shutdown
+    atexit.register(_hailo_shutdown)
+    logger.info("Hailo VDevice atexit handler registered ✓")
+except ImportError:
+    pass   # hailo_platform not present (dev machine) — nothing to register
+
 
 speaker = Speaker()
 
@@ -197,7 +211,7 @@ def display_loop():
         elif window_open:
             cv2.imshow(WINDOW_NAME, stopped)
 
-        # ── waitKey keeps Qt event loop alive (must run continuously) ────
+        # ── waitKey keeps Qt event loop alive ────────────────────────────
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q') and window_open:
             logger.info("'q' pressed — stopping active modules")
@@ -253,11 +267,9 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-        try:
-            from modules.currency.currency_detector import shutdown as hailo_shutdown
-            hailo_shutdown()
-        except Exception:
-            pass
+        # NOTE: hailo_device.shutdown() is called automatically via atexit —
+        # no manual call needed here.  camera_manager and cv2 still shut down
+        # explicitly since they are not covered by atexit.
 
         try:
             from utils.camera_manager import camera_manager

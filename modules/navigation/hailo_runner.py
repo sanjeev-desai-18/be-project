@@ -7,19 +7,21 @@ HEF models used by the navigation module:
     Midas_v2_small_model.hef  — monocular depth estimation
     yolov8m.hef               — object detection (COCO 80-class)
 
-Both wrappers share the same pattern:
-  1. Open the HEF and create a VDevice / InferVStreams context.
-  2. expose a run(frame) → result method that is safe to call from a
-     single background thread (no internal locking needed).
-  3. Expose a close() method for graceful shutdown.
+Changes from previous version
+------------------------------
+1.  Shared VDevice  — both runners now call utils.hailo_device.get_vdevice()
+    instead of opening their own VDevice().  A single VDevice with
+    ROUND_ROBIN scheduling is shared across navigation AND currency, which
+    eliminates the ~5 s stall that occurred when switching between modes.
 
-IMPORTANT — Hailo SDK import path:
-  On the Raspberry Pi 5 + Hailo 8 AI HAT the Python bindings are installed
-  by the hailort wheel. They live under:
-      from hailo_platform import HEF, VDevice, HailoStreamInterface, \
-           InferVStreams, ConfigureParams, InputVStreamParams, OutputVStreamParams
-  If the import fails we fall back to CPU-only stubs so the rest of the
-  module still loads (useful during development on a non-Pi machine).
+2.  close() no longer releases the VDevice  — it only deactivates the
+    configured network.  The device lifetime is managed by
+    utils.hailo_device.shutdown() at process exit.
+
+3.  CPU fallback guard  — if the HEF file exists on disk but fails to load
+    (e.g. a transient driver error), we do NOT try to download yolov8n.pt.
+    That download is only attempted when there is genuinely no HEF present
+    (i.e. a developer workstation without the AI HAT).
 """
 
 from __future__ import annotations
@@ -34,7 +36,6 @@ from utils.logger import logger
 try:
     from hailo_platform import (          # type: ignore
         HEF,
-        VDevice,
         HailoStreamInterface,
         InferVStreams,
         ConfigureParams,
@@ -68,19 +69,16 @@ class HailoDepthRunner:
     runner.close()
     """
 
-    # MiDaS small expects 256×256 RGB input (check your compiled HEF dims)
     INPUT_W = 256
     INPUT_H = 256
 
     def __init__(self, hef_path: str):
         self.hef_path = hef_path
         self._ready   = False
-        # Hailo objects (only set when Hailo is available)
-        self._target   = None
+        self._target   = None   # shared VDevice reference (not owned)
         self._network  = None
         self._hef      = None
-        # CPU fallback objects
-        self._torch_model   = None
+        self._torch_model    = None
         self._torch_transform = None
 
     # ── public API ──────────────────────────────────────────────────────────
@@ -93,10 +91,16 @@ class HailoDepthRunner:
                 logger.info("HailoDepthRunner: MiDaS HEF loaded ✓")
                 return True
             except Exception as e:
-                logger.error(f"HailoDepthRunner: HEF load failed ({e}), "
-                             "trying CPU fallback")
+                logger.error(
+                    f"HailoDepthRunner: HEF load failed ({e}). "
+                    f"{'Skipping CPU fallback (HEF present — Pi deployment).' if os.path.exists(self.hef_path) else 'Trying CPU fallback.'}"
+                )
+                if os.path.exists(self.hef_path):
+                    # HEF present but broken — gradient fallback only, no download
+                    self._ready = True
+                    return False
 
-        # CPU fallback — PyTorch MiDaS small
+        # Only attempt CPU fallback on dev machines where no HEF is installed
         return self._load_cpu_fallback()
 
     def estimate(self, bgr_frame: np.ndarray) -> np.ndarray:
@@ -104,26 +108,26 @@ class HailoDepthRunner:
         if not self._ready:
             return self._gradient_fallback(bgr_frame)
 
-        if self._target is not None:          # Hailo path
+        if self._network is not None:
             return self._estimate_hailo(bgr_frame)
-        elif self._torch_model is not None:   # CPU torch path
+        elif self._torch_model is not None:
             return self._estimate_torch(bgr_frame)
         else:
             return self._gradient_fallback(bgr_frame)
 
     def to_meters(self, val: float) -> float:
-        """Map a depth pixel value (0-255, higher = closer) to metres."""
+        """Map a depth pixel value (0–255, higher = closer) to metres."""
         norm = (255 - val) / 255.0
         return round(0.2 + norm * 12.0, 1)   # 0.2 m … 12.2 m
 
     def close(self):
+        """Deactivate the configured network.  Does NOT release the VDevice."""
         try:
             if self._network is not None:
                 self._network.deactivate()
                 self._network = None
-            if self._target is not None:
-                self._target.release()
-                self._target = None
+            # self._target is the shared VDevice — do NOT call release() on it
+            self._target = None
             logger.info("HailoDepthRunner: closed")
         except Exception as e:
             logger.warning(f"HailoDepthRunner.close(): {e}")
@@ -131,8 +135,9 @@ class HailoDepthRunner:
     # ── Hailo internals ─────────────────────────────────────────────────────
 
     def _load_hailo(self):
+        from utils.hailo_device import get_vdevice
         self._hef    = HEF(self.hef_path)
-        self._target = VDevice(device_count=1)
+        self._target = get_vdevice()            # ← shared VDevice
         cfg_params   = ConfigureParams.create_from_hef(
             self._hef, interface=HailoStreamInterface.PCIe
         )
@@ -142,7 +147,6 @@ class HailoDepthRunner:
     def _estimate_hailo(self, bgr_frame: np.ndarray) -> np.ndarray:
         orig_h, orig_w = bgr_frame.shape[:2]
 
-        # Pre-process: resize, BGR→RGB, float32 normalised [0,1]
         rgb = cv2.cvtColor(
             cv2.resize(bgr_frame, (self.INPUT_W, self.INPUT_H)),
             cv2.COLOR_BGR2RGB
@@ -150,7 +154,7 @@ class HailoDepthRunner:
 
         input_data = {
             self._network.get_input_vstream_infos()[0].name:
-                rgb[np.newaxis, ...]   # add batch dim
+                rgb[np.newaxis, ...]
         }
 
         try:
@@ -161,13 +165,11 @@ class HailoDepthRunner:
             with InferVStreams(self._network, in_params, out_params) as pipeline:
                 out = pipeline.infer(input_data)
 
-            # output is expected shape (1, H, W) or (1, 1, H, W)
             raw = list(out.values())[0].squeeze()
         except Exception as e:
             logger.warning(f"HailoDepthRunner inference error: {e}")
             return self._gradient_fallback(bgr_frame)
 
-        # Normalise raw depth to uint8 and resize back to original resolution
         dm = cv2.normalize(raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         return cv2.resize(dm, (orig_w, orig_h))
 
@@ -190,7 +192,7 @@ class HailoDepthRunner:
             return True
         except Exception as e:
             logger.error(f"HailoDepthRunner: CPU fallback also failed: {e}")
-            self._ready = True   # let gradient fallback handle it
+            self._ready = True   # gradient fallback will be used
             return False
 
     def _estimate_torch(self, bgr_frame: np.ndarray) -> np.ndarray:
@@ -213,8 +215,6 @@ class HailoDepthRunner:
             logger.warning(f"torch depth estimation failed: {e}")
             return self._gradient_fallback(bgr_frame)
 
-    # ── Last-resort gradient-edge depth proxy ────────────────────────────────
-
     @staticmethod
     def _gradient_fallback(bgr_frame: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2GRAY)
@@ -229,7 +229,6 @@ class HailoDepthRunner:
 #  YOLO RUNNER  (yolov8m.hef)
 # ════════════════════════════════════════════════════════════════════════════
 
-# COCO class names (80 classes) — same order as ultralytics/YOLOv8 training
 COCO_CLASSES = [
     "person","bicycle","car","motorcycle","airplane","bus","train","truck",
     "boat","traffic light","fire hydrant","stop sign","parking meter","bench",
@@ -259,7 +258,6 @@ class HailoYOLORunner:
       {name, conf, bbox:(x1,y1,x2,y2), zone_idx:0-4, high_priority:bool}
     """
 
-    # YOLOv8m HEF compiled for 640×640
     INPUT_W = 640
     INPUT_H = 640
 
@@ -267,10 +265,9 @@ class HailoYOLORunner:
         self.hef_path       = hef_path
         self.conf_threshold = conf_threshold
         self._ready         = False
-        self._target        = None
+        self._target        = None   # shared VDevice reference (not owned)
         self._network       = None
         self._hef           = None
-        # ultralytics fallback
         self._ultra_model   = None
 
     # ── public API ──────────────────────────────────────────────────────────
@@ -283,8 +280,15 @@ class HailoYOLORunner:
                 logger.info("HailoYOLORunner: YOLOv8m HEF loaded ✓")
                 return True
             except Exception as e:
-                logger.error(f"HailoYOLORunner: HEF load failed ({e}), "
-                             "trying CPU fallback")
+                logger.error(
+                    f"HailoYOLORunner: HEF load failed ({e}). "
+                    f"{'Skipping CPU fallback (HEF present — Pi deployment).' if os.path.exists(self.hef_path) else 'Trying CPU fallback.'}"
+                )
+                if os.path.exists(self.hef_path):
+                    # HEF is present — we're on a Pi.  Do NOT attempt to
+                    # download yolov8n.pt; return empty detections instead.
+                    self._ready = True
+                    return False
 
         return self._load_cpu_fallback()
 
@@ -292,20 +296,20 @@ class HailoYOLORunner:
         """Return list of detection dicts, or [] on failure."""
         if not self._ready:
             return []
-        if self._target is not None:
+        if self._network is not None:
             return self._detect_hailo(bgr_frame)
         elif self._ultra_model is not None:
             return self._detect_ultralytics(bgr_frame)
         return []
 
     def close(self):
+        """Deactivate the configured network.  Does NOT release the VDevice."""
         try:
             if self._network is not None:
                 self._network.deactivate()
                 self._network = None
-            if self._target is not None:
-                self._target.release()
-                self._target = None
+            # self._target is the shared VDevice — do NOT call release() on it
+            self._target = None
             logger.info("HailoYOLORunner: closed")
         except Exception as e:
             logger.warning(f"HailoYOLORunner.close(): {e}")
@@ -313,8 +317,9 @@ class HailoYOLORunner:
     # ── Hailo internals ─────────────────────────────────────────────────────
 
     def _load_hailo(self):
+        from utils.hailo_device import get_vdevice
         self._hef    = HEF(self.hef_path)
-        self._target = VDevice(device_count=1)
+        self._target = get_vdevice()            # ← shared VDevice
         cfg_params   = ConfigureParams.create_from_hef(
             self._hef, interface=HailoStreamInterface.PCIe
         )
@@ -324,10 +329,9 @@ class HailoYOLORunner:
     def _detect_hailo(self, bgr_frame: np.ndarray) -> list:
         orig_h, orig_w = bgr_frame.shape[:2]
 
-        # Pre-process: resize to 640×640, BGR→RGB, uint8
         resized = cv2.resize(bgr_frame, (self.INPUT_W, self.INPUT_H))
         rgb     = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        inp     = rgb[np.newaxis, ...]   # (1, 640, 640, 3)
+        inp     = rgb[np.newaxis, ...]
 
         input_name = self._network.get_input_vstream_infos()[0].name
         input_data = {input_name: inp.astype(np.uint8)}
@@ -347,20 +351,9 @@ class HailoYOLORunner:
 
     def _parse_hailo_output(self, raw_out: dict,
                             orig_w: int, orig_h: int) -> list:
-        """
-        Parse the flat detection output from a Hailo-compiled YOLOv8 model.
-
-        Hailo YOLOv8 post-processing outputs detections in a tensor with
-        shape (1, N, 85) where each row is [x, y, w, h, obj_conf, cls0…cls79]
-        in normalised coords [0,1].  Some HEF builds output separate tensors
-        for boxes and scores — we handle both.
-        """
         dets = []
-        sx = orig_w / self.INPUT_W
-        sy = orig_h / self.INPUT_H
 
         try:
-            # Attempt to find a combined (N,85) or (1,N,85) tensor
             combined = None
             for v in raw_out.values():
                 arr = np.array(v).squeeze()
@@ -378,7 +371,6 @@ class HailoYOLORunner:
                     if cls_conf < self.conf_threshold:
                         continue
 
-                    # xywh → xyxy (normalised → pixel)
                     cx, cy, bw, bh = row[0], row[1], row[2], row[3]
                     x1 = int((cx - bw / 2) * orig_w)
                     y1 = int((cy - bh / 2) * orig_h)
@@ -398,7 +390,6 @@ class HailoYOLORunner:
                         "high_priority": name in HIGH_PRIORITY,
                     })
             else:
-                # Try to locate boxes + scores tensors separately
                 boxes_tensor  = None
                 scores_tensor = None
                 for k, v in raw_out.items():
@@ -410,16 +401,14 @@ class HailoYOLORunner:
 
                 if boxes_tensor is not None and scores_tensor is not None:
                     for i, box in enumerate(boxes_tensor):
-                        scores    = scores_tensor[i] if i < len(scores_tensor) else []
+                        scores   = scores_tensor[i] if i < len(scores_tensor) else []
                         if len(scores) == 0:
                             continue
-                        cls_idx   = int(np.argmax(scores))
-                        cls_conf  = float(scores[cls_idx])
+                        cls_idx  = int(np.argmax(scores))
+                        cls_conf = float(scores[cls_idx])
                         if cls_conf < self.conf_threshold:
                             continue
 
-                        # box in [y1,x1,y2,x2] normalised (common TF convention)
-                        # or [x1,y1,x2,y2] — heuristic: if box[0] < box[2] prefer xyxy
                         if box[0] < box[2] and box[1] < box[3]:
                             x1 = int(box[0] * orig_w); y1 = int(box[1] * orig_h)
                             x2 = int(box[2] * orig_w); y2 = int(box[3] * orig_h)
@@ -444,6 +433,7 @@ class HailoYOLORunner:
         return dets
 
     # ── CPU fallback (ultralytics) ───────────────────────────────────────────
+    # Only reached when the HEF file does NOT exist (developer workstation).
 
     def _load_cpu_fallback(self) -> bool:
         try:

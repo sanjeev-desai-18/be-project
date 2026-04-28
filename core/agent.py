@@ -30,6 +30,7 @@ User said: "{transcript}"
 
 Pick ONE mode from this list:
 - navigation_mode
+- scene_mode
 - reading_mode
 - currency_mode
 - stop_mode
@@ -41,7 +42,7 @@ Hints:
 - paisa, note, money, currency, kitne ka → currency_mode
 - stop, band karo, ruk jao, bas, stop navigation, stop navigating → stop_mode
 - read, padho, kya likha hai → reading_mode
-- surroundings, aas paas, bata kya hai, describe, surrounding → navigation_mode
+- surroundings, aas paas, bata kya hai, describe, what do you see, describe surroundings, describe scene, what is around me → scene_mode
 - activate navigation, navigation mode, start navigation, navigate, guide me, help me walk, blindnav, obstacle detection, proximity, path guide → navigation_mode
 - news, weather, time, who is, what is, information, update → knowledge_mode
 
@@ -58,11 +59,12 @@ CONFIDENCE RULES — follow these strictly:
   with false high confidence. It is always safer to ask than to act on noise.
 
 IMPORTANT: Return ONLY a raw JSON object. No markdown. No code fences. No explanation.
-Example: {{"mode": "navigation_mode", "confidence": 0.92, "cleaned_text": "activate navigation mode", "extra_context": ""}}
+Example: {{"mode": "scene_mode", "confidence": 0.92, "cleaned_text": "describe surroundings", "extra_context": ""}}
 """
 
 VALID_MODES = {
     "navigation_mode",
+    "scene_mode",          # ← added: "describe surroundings" routes here
     "reading_mode",
     "currency_mode",
     "stop_mode",
@@ -71,7 +73,7 @@ VALID_MODES = {
 }
 
 # Modes that trigger hardware (camera, etc.) — held to a stricter confidence bar.
-_ACTION_MODES = {"navigation_mode", "reading_mode", "currency_mode"}
+_ACTION_MODES = {"navigation_mode", "scene_mode", "reading_mode", "currency_mode"}
 
 _ACTION_MIN_CONFIDENCE  = 0.75
 _READING_MIN_CONFIDENCE = 0.85
@@ -97,7 +99,6 @@ def _stop_all_active_modes() -> None:
     Stop currency and/or navigation if either is running.
     Waits for camera to be released before returning.
     """
-    # Stop navigation first (it also holds the camera)
     try:
         import modules.navigation.navigation_module as _nav
         if _nav.navigation_active:
@@ -108,7 +109,6 @@ def _stop_all_active_modes() -> None:
     except Exception as e:
         logger.error(f"_stop_all_active_modes (nav): {e}", exc_info=True)
 
-    # Stop currency
     try:
         import modules.currency.currency_module as _cm
         import modules.currency.currency_detector as _det
@@ -218,6 +218,7 @@ def route_to_module(state: AssistantState) -> str:
 
     routes = {
         "navigation_mode": "navigation_node",
+        "scene_mode":      "scene_node",       # ← was missing; "describe surroundings" now lands here
         "reading_mode":    "reading_node",
         "currency_mode":   "currency_node",
         "stop_mode":       "stop_node",
@@ -227,7 +228,7 @@ def route_to_module(state: AssistantState) -> str:
 
 
 # ═══════════════════════════════════════════════
-# NODE 3a — Navigation  ← NEW
+# NODE 3a — Navigation
 # ═══════════════════════════════════════════════
 def navigation_node(state: AssistantState) -> AssistantState:
     from modules.navigation.navigation_module import (
@@ -240,7 +241,6 @@ def navigation_node(state: AssistantState) -> AssistantState:
         logger.info("Navigation already active — skipping duplicate start")
         return {**state, "final_output": ""}
 
-    # Release any other mode that may hold the camera
     _stop_all_active_modes()
 
     sp = Speaker()
@@ -258,7 +258,7 @@ def navigation_node(state: AssistantState) -> AssistantState:
 
 
 # ═══════════════════════════════════════════════
-# NODE 3b — Scene  (kept for backward compat)
+# NODE 3b — Scene
 # ═══════════════════════════════════════════════
 def scene_node(state: AssistantState) -> AssistantState:
     from modules.scene.scene_module import SceneModule
@@ -397,7 +397,7 @@ def build_agent():
 
     graph.add_node("interpret_intent",  interpret_intent_node)
     graph.add_node("confidence_router", confidence_router_node)
-    graph.add_node("navigation_node",   navigation_node)      # ← NEW
+    graph.add_node("navigation_node",   navigation_node)
     graph.add_node("scene_node",        scene_node)
     graph.add_node("reading_node",      reading_node)
     graph.add_node("currency_node",     currency_node)
@@ -412,8 +412,8 @@ def build_agent():
         "confidence_router",
         route_to_module,
         {
-            "navigation_node": "navigation_node",   # ← NEW
-            "scene_node":      "scene_node",
+            "navigation_node": "navigation_node",
+            "scene_node":      "scene_node",       # ← wired into graph
             "reading_node":    "reading_node",
             "currency_node":   "currency_node",
             "stop_node":       "stop_node",
@@ -422,7 +422,7 @@ def build_agent():
         }
     )
 
-    graph.add_edge("navigation_node", "tts_node")   # ← NEW
+    graph.add_edge("navigation_node", "tts_node")
     graph.add_edge("scene_node",      "tts_node")
     graph.add_edge("reading_node",    "tts_node")
     graph.add_edge("currency_node",   "tts_node")

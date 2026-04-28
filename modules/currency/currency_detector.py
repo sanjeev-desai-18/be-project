@@ -3,17 +3,23 @@ modules/currency/currency_detector.py
 
 Hailo-8 YOLO currency detection pipeline.
 
-Performance fixes vs previous version:
-  - _capture_with_timeout() replaced with direct capture_array() call.
-    The old version spawned a new threading.Thread every single frame —
-    at 15 fps that is 15 thread-create/destroy cycles per second, adding
-    ~5–10 ms of overhead per frame and thrashing the GIL.
-  - CONFIRM_WINDOW reduced 20 → 8, CONFIRM_HITS 14 → 6.  At 15 fps a
-    note now confirms in ~0.5 s instead of ~1.3 s.
-  - ANNOUNCE_REPEAT / announce_count / mark_announced removed entirely.
-    currency_logic fires on new confirmed track IDs — no silent budget.
-  - Camera no longer hard-locked to 30 fps (FrameRate / FrameDurationLimits
-    removed from camera_manager currency config).
+Changes from previous version
+------------------------------
+1.  Shared VDevice  — replaced `picamera2.devices.Hailo` (which opened its
+    own implicit VDevice) with a direct `hailo_platform` call that uses the
+    process-wide shared VDevice from utils.hailo_device.  This eliminates
+    the ~5 s stall when switching between currency and navigation modes.
+
+2.  shutdown()  — no longer releases the VDevice.  The device lifetime is
+    managed by utils.hailo_device.shutdown() registered in main.py via
+    atexit.  shutdown() here only deactivates the configured network.
+
+Performance notes (unchanged from previous version)
+-----------------------------------------------------
+  - Direct capture_array() call instead of per-frame thread spawn.
+  - CONFIRM_WINDOW=8, CONFIRM_HITS=6 → confirms in ~0.5 s at 15 fps.
+  - ANNOUNCE_REPEAT / announce_count logic removed; currency_logic fires
+    on new confirmed track IDs.
 """
 
 import cv2
@@ -39,15 +45,12 @@ CLASS_NAMES_FALLBACK = [
 
 CONFIDENCE_THRESHOLD = 0.75
 
-# Smaller window = faster confirmation at low fps.
-# At 15 fps: 8 frames = 0.53 s, need 6/8 = 75% consistency.
-# At 30 fps: 8 frames = 0.27 s — still fast.
 CONFIRM_WINDOW = 8
 CONFIRM_HITS   = 6
 MAJORITY_RATIO = 0.75
 
-DISAPPEAR_FRAMES = 10
-TRACK_IOU_THRESH = 0.35
+DISAPPEAR_FRAMES  = 10
+TRACK_IOU_THRESH  = 0.35
 NMS_IOU_THRESHOLD = 0.50
 
 WINDOW_NAME = "Currency Detection - Hailo 8"
@@ -66,36 +69,114 @@ def _set_latest_frame(frame):
         _latest_frame[0] = frame
 
 
-# ── Hailo singleton ───────────────────────────────────────────────────────────
+# ── Hailo network manager (shared VDevice) ────────────────────────────────────
 class _HailoManager:
+    """
+    Loads the currency HEF onto the shared VDevice and manages the
+    configured network lifetime.
+
+    The VDevice itself is owned by utils.hailo_device — we never call
+    vdevice.release() here.
+    """
+
     def __init__(self):
-        self._hailo   = None
-        self._model_h = 640
-        self._model_w = 640
-        self._lock    = threading.Lock()
+        self._network    = None
+        self._model_h    = 640
+        self._model_w    = 640
+        self._lock       = threading.Lock()
 
     def get(self):
+        """Return (network, model_h, model_w), loading HEF on first call."""
         with self._lock:
-            if self._hailo is not None:
-                return self._hailo, self._model_h, self._model_w
+            if self._network is not None:
+                return self._network, self._model_h, self._model_w
+
             if not os.path.exists(HEF_PATH):
-                raise RuntimeError(f"HEF not found: {HEF_PATH}")
-            from picamera2.devices import Hailo
-            logger.info("HailoManager: opening Hailo device...")
-            hailo = Hailo(HEF_PATH)
-            h, w, _ = hailo.get_input_shape()
-            self._hailo, self._model_h, self._model_w = hailo, h, w
-            logger.info(f"HailoManager: ready {w}x{h}")
-            return self._hailo, self._model_h, self._model_w
+                raise RuntimeError(f"Currency HEF not found: {HEF_PATH}")
+
+            try:
+                from hailo_platform import (        # type: ignore
+                    HEF,
+                    HailoStreamInterface,
+                    ConfigureParams,
+                )
+                from utils.hailo_device import get_vdevice
+
+                logger.info("HailoManager (currency): loading HEF on shared VDevice…")
+                hef        = HEF(HEF_PATH)
+                vdevice    = get_vdevice()
+                cfg_params = ConfigureParams.create_from_hef(
+                    hef, interface=HailoStreamInterface.PCIe
+                )
+                network = vdevice.configure(hef, cfg_params)[0]
+                network.activate()
+
+                # Derive input shape from vstream info
+                info = network.get_input_vstream_infos()[0]
+                # shape is (H, W, C) or similar; fall back to defaults if unknown
+                shape = getattr(info, "shape", None)
+                if shape and len(shape) >= 2:
+                    self._model_h, self._model_w = int(shape[0]), int(shape[1])
+
+                self._network = network
+                logger.info(
+                    f"HailoManager (currency): ready "
+                    f"{self._model_w}x{self._model_h} ✓"
+                )
+            except ImportError:
+                # hailo_platform not available — fall back to picamera2.devices.Hailo
+                # (developer machine or older image without the shared-device stack)
+                logger.warning(
+                    "hailo_platform not found — falling back to "
+                    "picamera2.devices.Hailo for currency"
+                )
+                from picamera2.devices import Hailo   # type: ignore
+                hailo = Hailo(HEF_PATH)
+                h, w, _ = hailo.get_input_shape()
+                # Wrap legacy object so callers get a consistent interface
+                self._network    = _LegacyHailoWrapper(hailo)
+                self._model_h, self._model_w = h, w
+                logger.info(
+                    f"HailoManager (currency): legacy Hailo ready "
+                    f"{self._model_w}x{self._model_h}"
+                )
+
+            return self._network, self._model_h, self._model_w
 
     def shutdown(self):
+        """Deactivate the configured network.  Does NOT release the VDevice."""
         with self._lock:
-            if self._hailo is not None:
-                try:
-                    self._hailo.close()
-                except Exception:
-                    pass
-                self._hailo = None
+            if self._network is None:
+                return
+            try:
+                if hasattr(self._network, "deactivate"):
+                    self._network.deactivate()
+                elif hasattr(self._network, "close"):
+                    self._network.close()
+                logger.info("HailoManager (currency): network deactivated")
+            except Exception as exc:
+                logger.warning(f"HailoManager (currency) shutdown error: {exc}")
+            finally:
+                self._network = None
+
+
+class _LegacyHailoWrapper:
+    """
+    Thin wrapper that makes a `picamera2.devices.Hailo` object look like a
+    hailo_platform network for the inference call in `_run()`.
+    Only used as a fallback when hailo_platform is not installed.
+    """
+    def __init__(self, hailo):
+        self._hailo = hailo
+
+    def run(self, frame_rgb):
+        return self._hailo.run(frame_rgb)
+
+    def deactivate(self):
+        try:
+            self._hailo.close()
+        except Exception:
+            pass
 
 
 hailo_manager = _HailoManager()
@@ -148,11 +229,6 @@ def _apply_nms(detections: list) -> list:
 
 # ── Note tracker ──────────────────────────────────────────────────────────────
 class _NoteTracker:
-    """
-    Assigns a persistent track_id to each physical note in the scene.
-    No announce_count — the tracker never silences tracks.
-    """
-
     def __init__(self):
         self._tracks: dict[int, dict] = {}
         self._next_id = 1
@@ -231,7 +307,6 @@ class _NoteTracker:
         for trk in self._tracks.values():
             self._check_gate(trk)
 
-        # Build result for all detections visible this frame
         pairs2 = sorted(
             [
                 (_iou(trk["box"], det), tid, di)
@@ -340,7 +415,7 @@ def _run(stop_evt, camera_released_evt):
     camera_released_evt.clear()
 
     try:
-        hailo, model_h, model_w = hailo_manager.get()
+        network, model_h, model_w = hailo_manager.get()
         logger.info(f"_run(): Hailo OK {model_w}x{model_h}")
     except Exception as e:
         logger.error(f"_run(): Hailo failed: {e}", exc_info=True)
@@ -374,14 +449,109 @@ def _run(stop_evt, camera_released_evt):
     logger.info("_run(): entering detection loop")
     fps_t = time.time(); fps_count = 0; fps = 0.0
 
+    # Resolve the inference callable once — works for both the shared-VDevice
+    # path (no .run()) and the legacy picamera2 wrapper (has .run()).
+    #
+    # Output format contract for _parse_hailo_output():
+    #   A list where index = class_id and value = array of shape (N, 5)
+    #   with columns [y1_norm, x1_norm, y2_norm, x2_norm, score].
+    #   This is what picamera2.devices.Hailo.run() already returns.
+    #   InferVStreams returns a dict keyed by layer name — we unpack it here
+    #   so _parse_hailo_output never has to deal with dict keys.
+
+    if hasattr(network, "run"):
+        # Legacy _LegacyHailoWrapper — already returns the per-class list.
+        infer_fn = network.run
+    else:
+        # hailo_platform configured network — use InferVStreams, then convert
+        # the raw output dict into the per-class list format.
+        from hailo_platform import (        # type: ignore
+            InferVStreams,
+            InputVStreamParams,
+            OutputVStreamParams,
+            FormatType,
+        )
+
+        num_classes = len(CLASS_NAMES)
+
+        def _unpack_nms_output(raw_dict: dict) -> list:
+            """
+            Convert InferVStreams output dict -> per-class detection list.
+
+            Hailo YOLOv8/YOLO11 NMS postprocess output is RAGGED: each class
+            slot holds a variable number of detections so the whole structure
+            cannot be cast to a uniform numpy float32 array. That is exactly
+            the inhomogeneous-shape error that was crashing inference.
+
+            Observed layout from the HEF:
+              {
+                'yolov11s/yolov8_nms_postprocess': [   # len=1  (batch)
+                  [                                    # len=num_classes
+                    ndarray(N0, 5),  # class 0  [y1, x1, y2, x2, score]
+                    ndarray(N1, 5),  # class 1  (N may differ per class)
+                    ...
+                  ]
+                ]
+              }
+
+            Fix: never call np.array() on the whole ragged structure.
+            Iterate class-by-class; each slot IS homogeneous (Ni x 5).
+            """
+            _empty = np.empty((0, 5), np.float32)
+
+            raw = list(raw_dict.values())[0]   # unwrap dict
+
+            # Strip the batch dimension (works for list or object ndarray)
+            if isinstance(raw, np.ndarray):
+                per_class = raw[0] if raw.ndim >= 1 else raw
+            elif isinstance(raw, (list, tuple)) and len(raw) == 1:
+                per_class = raw[0]
+            else:
+                per_class = raw
+
+            result = []
+            for cls_item in per_class:
+                if cls_item is None:
+                    result.append(_empty)
+                    continue
+                try:
+                    # Safe: each per-class slot is homogeneous (Ni x 5)
+                    cls_arr = np.asarray(cls_item, dtype=np.float32)
+                except (ValueError, TypeError):
+                    result.append(_empty)
+                    continue
+
+                if cls_arr.ndim == 0 or cls_arr.size == 0:
+                    result.append(_empty)
+                elif cls_arr.ndim == 1:
+                    # Single detection returned as a flat 1-D row
+                    if cls_arr.shape[0] >= 5 and float(cls_arr[4]) > 0:
+                        result.append(cls_arr[:5].reshape(1, 5))
+                    else:
+                        result.append(_empty)
+                else:
+                    # Normal (Ni, 5): keep rows with positive score
+                    if cls_arr.shape[1] >= 5:
+                        valid = cls_arr[cls_arr[:, 4] > 0]
+                        result.append(valid if len(valid) else _empty)
+                    else:
+                        result.append(_empty)
+
+            if not result:
+                logger.warning("_unpack_nms_output: empty per-class result")
+            return result
+
+        def infer_fn(frame_rgb):
+            inp_name   = network.get_input_vstream_infos()[0].name
+            input_data = {inp_name: frame_rgb[np.newaxis, ...]}
+            in_p  = InputVStreamParams.make(network, format_type=FormatType.UINT8)
+            out_p = OutputVStreamParams.make(network, format_type=FormatType.FLOAT32)
+            with InferVStreams(network, in_p, out_p) as pipe:
+                raw = pipe.infer(input_data)
+            return _unpack_nms_output(raw)
+
     try:
         while not stop_evt.is_set():
-            # Direct capture — no per-frame thread spawn.
-            # picam2.capture_array() blocks until the next frame arrives
-            # from the sensor (typically <33 ms at 30 fps). If the stop
-            # event fires while we are blocked here, we will unblock on the
-            # next frame (at most one frame delay, ~33 ms) and then exit the
-            # while-loop cleanly on the next iteration check.
             try:
                 frame = picam2.capture_array("main")
             except Exception as e:
@@ -398,12 +568,16 @@ def _run(stop_evt, camera_released_evt):
 
             img_h, img_w = frame.shape[:2]
             frame_rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            hailo_output = hailo.run(frame_rgb)
-            detections   = _parse_hailo_output(hailo_output, img_w, img_h)
 
-            tracked = _note_tracker.update(detections)
+            try:
+                hailo_output = infer_fn(frame_rgb)
+            except Exception as e:
+                logger.warning(f"inference error: {e}")
+                continue
 
-            # Pass all confirmed tracks — logic decides whether to speak
+            detections = _parse_hailo_output(hailo_output, img_w, img_h)
+            tracked    = _note_tracker.update(detections)
+
             confirmed = [t for t in tracked if t["confirmed_cls"] is not None]
             process_confirmed_notes(confirmed)
 
@@ -465,4 +639,5 @@ def wait_for_camera_release(timeout=5.0):
 
 
 def shutdown():
+    """Deactivate the currency network.  VDevice lifetime is in hailo_device."""
     hailo_manager.shutdown()
