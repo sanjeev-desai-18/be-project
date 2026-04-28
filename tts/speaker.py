@@ -769,7 +769,9 @@ _CURRENCY_PRECACHE = [
 _SYSTEM_PRECACHE = [
     "Sorry, I had trouble understanding that.",
     "No microphone detected. Please connect a USB microphone.",
-    "Blind assistant ready. Say currency check, activate navigation, or describe surroundings.",
+    "Hii, your personal visionmate assistant is ready. "
+    "I can help you with scene description, currency check, "
+    "navigate your surrounding, read documents and improve knowledge.",
     "Goodbye!",
     "Activating navigation mode. I will guide you.",
     "Navigation mode on.",
@@ -781,6 +783,97 @@ _SYSTEM_PRECACHE = [
     "Currency mode on.",
     "I could not start currency detection.",
     "Stopped.",
+]
+
+# ── Navigation pre-cache: every possible nav response ────────────────────────
+# These are all the fixed messages the navigation speech scheduler can produce.
+# Pre-synthesizing them means ZERO latency on first play.
+
+_NAV_PRECACHE = [
+    # ── Danger alerts ────────────────────────────────────────────────────────
+    "Stop! Move left.",
+    "Stop! Move right.",
+    "Stop! Move far left.",
+    "Stop! Move far right.",
+    "Stop! Move center.",
+    "Stop! Do not move forward.",
+
+    # ── Navigation instructions ──────────────────────────────────────────────
+    "Forward path is clear",
+    "Walk straight",
+    "Move one step left",
+    "Move one step right",
+    "Move to your far left",
+    "Move to your far right",
+    "Path blocked. Stop",
+    "Move slightly left",
+    "Move slightly right",
+    "Move slightly far left",
+    "Move slightly far right",
+
+    # ── Zone cleared ─────────────────────────────────────────────────────────
+    "far left is now clear.",
+    "left is now clear.",
+    "center is now clear.",
+    "right is now clear.",
+    "far right is now clear.",
+
+    # ── Common YOLO objects with step counts (1-4 steps, 3 positions) ────────
+    # person
+    "person 1 step ahead.",
+    "person 2 steps ahead.",
+    "person 3 steps ahead.",
+    "person 1 step to your left.",
+    "person 2 steps to your left.",
+    "person 3 steps to your left.",
+    "person 1 step to your right.",
+    "person 2 steps to your right.",
+    "person 3 steps to your right.",
+    # car
+    "car 1 step ahead.",
+    "car 2 steps ahead.",
+    "car 3 steps ahead.",
+    "car 1 step to your left.",
+    "car 2 steps to your left.",
+    "car 1 step to your right.",
+    "car 2 steps to your right.",
+    # chair
+    "chair 1 step ahead.",
+    "chair 2 steps ahead.",
+    "chair 1 step to your left.",
+    "chair 1 step to your right.",
+    # bicycle / motorcycle
+    "bicycle 1 step ahead.",
+    "bicycle 2 steps ahead.",
+    "motorcycle 1 step ahead.",
+    "motorcycle 2 steps ahead.",
+    # truck / bus
+    "truck 1 step ahead.",
+    "truck 2 steps ahead.",
+    "bus 1 step ahead.",
+    "bus 2 steps ahead.",
+    # dog / cat
+    "dog 1 step ahead.",
+    "dog 2 steps ahead.",
+    "dog 1 step to your left.",
+    "dog 1 step to your right.",
+    "cat 1 step ahead.",
+    "cat 1 step to your left.",
+    "cat 1 step to your right.",
+
+    # ── YOLO + escape combos (most common) ───────────────────────────────────
+    "person 1 step ahead. Move left.",
+    "person 1 step ahead. Move right.",
+    "person 2 steps ahead. Move left.",
+    "person 2 steps ahead. Move right.",
+    "person 1 step to your right. Move left.",
+    "person 1 step to your left. Move right.",
+    "person 2 steps to your right. Move left.",
+    "person 2 steps to your left. Move right.",
+    "car 1 step ahead. Move left.",
+    "car 1 step ahead. Move right.",
+    "car 2 steps ahead. Move left.",
+    "car 2 steps ahead. Move right.",
 ]
 
 
@@ -851,7 +944,7 @@ def _prefill_cache():
     logger.info("TTS cache: starting edge-tts pre-fill…")
 
     ok = 0
-    all_msgs = _CURRENCY_PRECACHE + _SYSTEM_PRECACHE
+    all_msgs = _CURRENCY_PRECACHE + _SYSTEM_PRECACHE + _NAV_PRECACHE
     for msg in all_msgs:
         pcm = _edge_tts_to_pcm(msg)
         if pcm is not None:
