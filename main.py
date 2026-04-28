@@ -112,8 +112,9 @@ def mic_loop():
 
     logger.info("Microphone loop started — listening for commands")
     speaker.speak(
-        "Blind assistant ready. "
-        "Say currency check, activate navigation, or describe surroundings."
+        "Hii, your personal visionmate assistant is ready. "
+        "I can help you with scene description, currency check, "
+        "navigate your surrounding, read documents and improve knowledge."
     )
 
     while True:

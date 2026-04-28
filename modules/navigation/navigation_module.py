@@ -211,16 +211,22 @@ class NavSpeechScheduler:
                     zone_info = next((z for z in zones if z["name"] == zone_name), None)
                     dist_m = zone_info["distance_m"] if zone_info else 3.0
                     steps = self._steps(dist_m)
-                    avoid = self._escape_direction(zones, zone_name)
+
+                    # Position description
                     if zone_name == "center":
                         pos = "ahead"
                     elif zone_name in ("left", "far left"):
                         pos = "to your left"
                     else:
                         pos = "to your right"
+
                     msg = f"{name} {steps} step{'s' if steps != 1 else ''} {pos}."
+
+                    # Escape AWAY from the object (opposite direction)
+                    avoid = self._away_from(zone_name, zones)
                     if avoid:
                         msg += f" Move {avoid}."
+
                     self._speak_cached(speaker, msg)
                     self._last_obj[name] = now
                     return
@@ -321,6 +327,40 @@ class NavSpeechScheduler:
             z = zm.get(order[i])
             if z and z["level"] in ("clear", "notice") and order[i] != blocked:
                 return order[i]
+        return ""
+
+    @staticmethod
+    def _away_from(object_zone: str, zones: list) -> str:
+        """
+        Suggest moving AWAY from the zone where an object was detected.
+        Object on right → suggest left.  Object on left → suggest right.
+        Object ahead → suggest whichever side has more space.
+        Only suggests if the opposite side is actually clear/notice.
+        """
+        zm = {z["name"]: z for z in zones}
+        # Map each zone to its opposite candidates (away direction)
+        opposite = {
+            "far right": ["left", "far left"],
+            "right":     ["left", "far left"],
+            "center":    [],   # handled specially below
+            "left":      ["right", "far right"],
+            "far left":  ["right", "far right"],
+        }
+
+        if object_zone == "center":
+            # Object ahead: suggest the side with more space
+            ld = zm.get("left", {}).get("distance_m", 0)
+            rd = zm.get("right", {}).get("distance_m", 0)
+            if ld > rd and zm.get("left", {}).get("level") in ("clear", "notice"):
+                return "left"
+            elif rd > ld and zm.get("right", {}).get("level") in ("clear", "notice"):
+                return "right"
+            return ""
+
+        for candidate in opposite.get(object_zone, []):
+            z = zm.get(candidate)
+            if z and z["level"] in ("clear", "notice"):
+                return candidate
         return ""
 
 
