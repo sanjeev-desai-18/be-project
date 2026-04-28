@@ -1,32 +1,17 @@
 """
 modules/navigation/hailo_runner.py
 
-Thin wrappers around the Hailo Runtime SDK (hailo_platform) for the two
-HEF models used by the navigation module:
+Hailo inference runners for navigation: SCDepthV3 + YOLOv8m.
+Uses persistent InferVStreams threads (matching the proven standalone pattern).
 
-    Midas_v2_small_model.hef  — monocular depth estimation
-    yolov8m.hef               — object detection (COCO 80-class)
-
-Changes from previous version
-------------------------------
-1.  Shared VDevice  — both runners now call utils.hailo_device.get_vdevice()
-    instead of opening their own VDevice().  A single VDevice with
-    ROUND_ROBIN scheduling is shared across navigation AND currency, which
-    eliminates the ~5 s stall that occurred when switching between modes.
-
-2.  close() no longer releases the VDevice  — it only deactivates the
-    configured network.  The device lifetime is managed by
-    utils.hailo_device.shutdown() at process exit.
-
-3.  CPU fallback guard  — if the HEF file exists on disk but fails to load
-    (e.g. a transient driver error), we do NOT try to download yolov8n.pt.
-    That download is only attempted when there is genuinely no HEF present
-    (i.e. a developer workstation without the AI HAT).
+Both runners share the process-wide VDevice from utils.hailo_device.
 """
 
 from __future__ import annotations
 
 import os
+import threading
+import queue
 import time
 import numpy as np
 import cv2
@@ -54,30 +39,37 @@ except ImportError:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  DEPTH RUNNER  (Midas_v2_small_model.hef)
+#  DEPTH RUNNER  (scdepthv3.hef or Midas_v2_small_model.hef)
 # ════════════════════════════════════════════════════════════════════════════
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -88, 88)))
+
 
 class HailoDepthRunner:
     """
-    Wraps the MiDaS v2 small HEF for monocular depth estimation.
+    Wraps a Hailo depth-estimation HEF for monocular depth.
 
-    Usage
-    -----
-    runner = HailoDepthRunner("/path/to/Midas_v2_small_model.hef")
-    runner.load()                       # opens device once
-    depth_u8 = runner.estimate(frame)   # returns H×W uint8 depth map
-    runner.close()
+    Supported models:
+      • scdepthv3.hef            — 320×256 input (preferred)
+      • Midas_v2_small_model.hef — 256×256 input (fallback)
+
+    Uses a persistent InferVStreams thread so the pipeline stays open.
     """
 
-    INPUT_W = 256
+    INPUT_W = 320
     INPUT_H = 256
 
     def __init__(self, hef_path: str):
         self.hef_path = hef_path
         self._ready   = False
-        self._target   = None   # shared VDevice reference (not owned)
-        self._network  = None
-        self._hef      = None
+        self._is_scdepth = "scdepth" in os.path.basename(hef_path).lower()
+        # Hailo pipeline thread
+        self._infer_q: queue.Queue = queue.Queue(maxsize=1)
+        self._result_q: queue.Queue = queue.Queue(maxsize=2)
+        self._thread: threading.Thread | None = None
+        self._pipeline_ready = threading.Event()
+        # CPU fallback
         self._torch_model    = None
         self._torch_transform = None
 
@@ -86,21 +78,16 @@ class HailoDepthRunner:
     def load(self) -> bool:
         if _HAILO_AVAILABLE and os.path.exists(self.hef_path):
             try:
-                self._load_hailo()
+                self._start_hailo_thread()
                 self._ready = True
-                logger.info("HailoDepthRunner: MiDaS HEF loaded ✓")
+                hef_name = os.path.basename(self.hef_path)
+                logger.info(f"HailoDepthRunner: {hef_name} loaded ({self.INPUT_W}×{self.INPUT_H}) ✓")
                 return True
             except Exception as e:
-                logger.error(
-                    f"HailoDepthRunner: HEF load failed ({e}). "
-                    f"{'Skipping CPU fallback (HEF present — Pi deployment).' if os.path.exists(self.hef_path) else 'Trying CPU fallback.'}"
-                )
+                logger.error(f"HailoDepthRunner: HEF load failed ({e}).")
                 if os.path.exists(self.hef_path):
-                    # HEF present but broken — gradient fallback only, no download
                     self._ready = True
                     return False
-
-        # Only attempt CPU fallback on dev machines where no HEF is installed
         return self._load_cpu_fallback()
 
     def estimate(self, bgr_frame: np.ndarray) -> np.ndarray:
@@ -108,7 +95,7 @@ class HailoDepthRunner:
         if not self._ready:
             return self._gradient_fallback(bgr_frame)
 
-        if self._network is not None:
+        if self._thread is not None and self._thread.is_alive():
             return self._estimate_hailo(bgr_frame)
         elif self._torch_model is not None:
             return self._estimate_torch(bgr_frame)
@@ -121,28 +108,57 @@ class HailoDepthRunner:
         return round(0.2 + norm * 12.0, 1)   # 0.2 m … 12.2 m
 
     def close(self):
-        """Deactivate the configured network.  Does NOT release the VDevice."""
+        """Stop the inference thread."""
         try:
-            if self._network is not None:
-                self._network.deactivate()
-                self._network = None
-            # self._target is the shared VDevice — do NOT call release() on it
-            self._target = None
+            if self._thread is not None and self._thread.is_alive():
+                self._infer_q.put(None)  # sentinel to stop thread
+                self._thread.join(timeout=3)
+            self._thread = None
             logger.info("HailoDepthRunner: closed")
         except Exception as e:
             logger.warning(f"HailoDepthRunner.close(): {e}")
 
-    # ── Hailo internals ─────────────────────────────────────────────────────
+    # ── Hailo persistent thread ─────────────────────────────────────────────
 
-    def _load_hailo(self):
+    def _start_hailo_thread(self):
         from utils.hailo_device import get_vdevice
-        self._hef    = HEF(self.hef_path)
-        self._target = get_vdevice()            # ← shared VDevice
-        cfg_params   = ConfigureParams.create_from_hef(
-            self._hef, interface=HailoStreamInterface.PCIe
-        )
-        self._network = self._target.configure(self._hef, cfg_params)[0]
-        self._network.activate()
+        hef    = HEF(self.hef_path)
+        target = get_vdevice()
+        cfg    = ConfigureParams.create_from_hef(hef, interface=HailoStreamInterface.PCIe)
+        ng     = target.configure(hef, cfg)[0]
+
+        # Detect input dimensions from HEF
+        in_info  = hef.get_input_vstream_infos()[0]
+        out_info = hef.get_output_vstream_infos()[0]
+        in_name  = in_info.name
+        out_name = out_info.name
+        shape    = in_info.shape
+        if len(shape) >= 3:
+            if shape[-1] <= 4:   # HxWxC
+                self.INPUT_H, self.INPUT_W = shape[0], shape[1]
+            else:                # CxHxW
+                self.INPUT_H, self.INPUT_W = shape[1], shape[2]
+        logger.info(f"HailoDepthRunner: detected input {self.INPUT_W}×{self.INPUT_H}")
+
+        def _worker():
+            ivp = InputVStreamParams.make(ng, format_type=FormatType.FLOAT32)
+            ovp = OutputVStreamParams.make(ng, format_type=FormatType.FLOAT32)
+            with InferVStreams(ng, ivp, ovp) as pipeline:
+                self._pipeline_ready.set()
+                while True:
+                    item = self._infer_q.get()
+                    if item is None:
+                        break
+                    try:
+                        raw = pipeline.infer({in_name: item})
+                        self._result_q.put(raw[out_name])
+                    except Exception as e:
+                        logger.warning(f"HailoDepthRunner inference error: {e}")
+                        self._result_q.put(None)
+
+        self._thread = threading.Thread(target=_worker, daemon=True, name="DepthInfer")
+        self._thread.start()
+        self._pipeline_ready.wait(timeout=10)
 
     def _estimate_hailo(self, bgr_frame: np.ndarray) -> np.ndarray:
         orig_h, orig_w = bgr_frame.shape[:2]
@@ -150,27 +166,49 @@ class HailoDepthRunner:
         rgb = cv2.cvtColor(
             cv2.resize(bgr_frame, (self.INPUT_W, self.INPUT_H)),
             cv2.COLOR_BGR2RGB
-        ).astype(np.float32) / 255.0
+        ).astype(np.float32)
 
-        input_data = {
-            self._network.get_input_vstream_infos()[0].name:
-                rgb[np.newaxis, ...]
-        }
+        # SCDepthV3 expects [0, 255] float32; MiDaS expects [0, 1]
+        if not self._is_scdepth:
+            rgb = rgb / 255.0
+
+        inp = rgb[np.newaxis, ...]
+
+        # Send to inference thread
+        try:
+            self._infer_q.put_nowait(inp)
+        except queue.Full:
+            try: self._infer_q.get_nowait()
+            except queue.Empty: pass
+            self._infer_q.put_nowait(inp)
 
         try:
-            in_params  = InputVStreamParams.make(self._network,
-                                                 format_type=FormatType.FLOAT32)
-            out_params = OutputVStreamParams.make(self._network,
-                                                  format_type=FormatType.FLOAT32)
-            with InferVStreams(self._network, in_params, out_params) as pipeline:
-                out = pipeline.infer(input_data)
-
-            raw = list(out.values())[0].squeeze()
-        except Exception as e:
-            logger.warning(f"HailoDepthRunner inference error: {e}")
+            raw = self._result_q.get(timeout=2.0)
+        except queue.Empty:
             return self._gradient_fallback(bgr_frame)
 
-        dm = cv2.normalize(raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        if raw is None:
+            return self._gradient_fallback(bgr_frame)
+
+        raw = np.squeeze(raw)
+
+        # Postprocess depends on model
+        if self._is_scdepth:
+            # SCDepthV3: sigmoid → inverse depth
+            depth = 1.0 / (_sigmoid(raw) * 10.0 + 0.009)
+            lo, hi = np.percentile(depth, 2), np.percentile(depth, 98)
+            if hi - lo < 1e-6:
+                dm = np.zeros((self.INPUT_H, self.INPUT_W), dtype=np.uint8)
+            else:
+                norm = np.clip((depth - lo) / (hi - lo), 0, 1)
+                dm = (norm * 255).astype(np.uint8)
+                # Invert so close objects = high value (matches MiDaS convention
+                # and INFERNO colormap: bright = close, dark = far)
+                dm = 255 - dm
+        else:
+            # MiDaS: simple normalize
+            dm = cv2.normalize(raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
         return cv2.resize(dm, (orig_w, orig_h))
 
     # ── CPU fallback (PyTorch MiDaS small) ──────────────────────────────────
@@ -192,7 +230,7 @@ class HailoDepthRunner:
             return True
         except Exception as e:
             logger.error(f"HailoDepthRunner: CPU fallback also failed: {e}")
-            self._ready = True   # gradient fallback will be used
+            self._ready = True
             return False
 
     def _estimate_torch(self, bgr_frame: np.ndarray) -> np.ndarray:
@@ -253,6 +291,7 @@ HIGH_PRIORITY = {
 class HailoYOLORunner:
     """
     Wraps the YOLOv8m HEF for real-time object detection.
+    Uses a persistent InferVStreams thread so the pipeline stays open.
 
     Returns detections as a list of dicts:
       {name, conf, bbox:(x1,y1,x2,y2), zone_idx:0-4, high_priority:bool}
@@ -261,164 +300,197 @@ class HailoYOLORunner:
     INPUT_W = 640
     INPUT_H = 640
 
-    def __init__(self, hef_path: str, conf_threshold: float = 0.45):
+    def __init__(self, hef_path: str, conf_threshold: float = 0.35):
         self.hef_path       = hef_path
         self.conf_threshold = conf_threshold
         self._ready         = False
-        self._target        = None   # shared VDevice reference (not owned)
-        self._network       = None
-        self._hef           = None
-        self._ultra_model   = None
+        # Hailo pipeline thread
+        self._infer_q: queue.Queue = queue.Queue(maxsize=1)
+        self._result_q: queue.Queue = queue.Queue(maxsize=2)
+        self._thread: threading.Thread | None = None
+        self._pipeline_ready = threading.Event()
+        self._ultra_model = None
 
     # ── public API ──────────────────────────────────────────────────────────
 
     def load(self) -> bool:
         if _HAILO_AVAILABLE and os.path.exists(self.hef_path):
             try:
-                self._load_hailo()
+                self._start_hailo_thread()
                 self._ready = True
                 logger.info("HailoYOLORunner: YOLOv8m HEF loaded ✓")
                 return True
             except Exception as e:
-                logger.error(
-                    f"HailoYOLORunner: HEF load failed ({e}). "
-                    f"{'Skipping CPU fallback (HEF present — Pi deployment).' if os.path.exists(self.hef_path) else 'Trying CPU fallback.'}"
-                )
+                logger.error(f"HailoYOLORunner: HEF load failed ({e}).")
                 if os.path.exists(self.hef_path):
-                    # HEF is present — we're on a Pi.  Do NOT attempt to
-                    # download yolov8n.pt; return empty detections instead.
                     self._ready = True
                     return False
-
         return self._load_cpu_fallback()
 
     def detect(self, bgr_frame: np.ndarray) -> list:
         """Return list of detection dicts, or [] on failure."""
         if not self._ready:
             return []
-        if self._network is not None:
+        if self._thread is not None and self._thread.is_alive():
             return self._detect_hailo(bgr_frame)
         elif self._ultra_model is not None:
             return self._detect_ultralytics(bgr_frame)
         return []
 
     def close(self):
-        """Deactivate the configured network.  Does NOT release the VDevice."""
+        """Stop the inference thread."""
         try:
-            if self._network is not None:
-                self._network.deactivate()
-                self._network = None
-            # self._target is the shared VDevice — do NOT call release() on it
-            self._target = None
+            if self._thread is not None and self._thread.is_alive():
+                self._infer_q.put(None)
+                self._thread.join(timeout=3)
+            self._thread = None
             logger.info("HailoYOLORunner: closed")
         except Exception as e:
             logger.warning(f"HailoYOLORunner.close(): {e}")
 
-    # ── Hailo internals ─────────────────────────────────────────────────────
+    # ── Hailo persistent thread ─────────────────────────────────────────────
 
-    def _load_hailo(self):
+    def _start_hailo_thread(self):
         from utils.hailo_device import get_vdevice
-        self._hef    = HEF(self.hef_path)
-        self._target = get_vdevice()            # ← shared VDevice
-        cfg_params   = ConfigureParams.create_from_hef(
-            self._hef, interface=HailoStreamInterface.PCIe
-        )
-        self._network = self._target.configure(self._hef, cfg_params)[0]
-        self._network.activate()
+        hef    = HEF(self.hef_path)
+        target = get_vdevice()
+        cfg    = ConfigureParams.create_from_hef(hef, interface=HailoStreamInterface.PCIe)
+        ng     = target.configure(hef, cfg)[0]
+
+        in_name = hef.get_input_vstream_infos()[0].name
+
+        def _worker():
+            ivp = InputVStreamParams.make(ng, format_type=FormatType.FLOAT32)
+            ovp = OutputVStreamParams.make(ng, format_type=FormatType.FLOAT32)
+            with InferVStreams(ng, ivp, ovp) as pipeline:
+                self._pipeline_ready.set()
+                while True:
+                    item = self._infer_q.get()
+                    if item is None:
+                        break
+                    try:
+                        raw = pipeline.infer({in_name: item})
+                        self._result_q.put(raw)
+                    except Exception as e:
+                        logger.warning(f"HailoYOLORunner inference error: {e}")
+                        self._result_q.put(None)
+
+        self._thread = threading.Thread(target=_worker, daemon=True, name="YOLOInfer")
+        self._thread.start()
+        self._pipeline_ready.wait(timeout=10)
 
     def _detect_hailo(self, bgr_frame: np.ndarray) -> list:
         orig_h, orig_w = bgr_frame.shape[:2]
 
-        resized = cv2.resize(bgr_frame, (self.INPUT_W, self.INPUT_H))
-        rgb     = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        inp     = rgb[np.newaxis, ...]
+        rgb = cv2.cvtColor(
+            cv2.resize(bgr_frame, (self.INPUT_W, self.INPUT_H)),
+            cv2.COLOR_BGR2RGB
+        ).astype(np.float32)
+        inp = rgb[np.newaxis, ...]
 
-        input_name = self._network.get_input_vstream_infos()[0].name
-        input_data = {input_name: inp.astype(np.uint8)}
+        # Send to inference thread
+        try:
+            self._infer_q.put_nowait(inp)
+        except queue.Full:
+            try: self._infer_q.get_nowait()
+            except queue.Empty: pass
+            self._infer_q.put_nowait(inp)
 
         try:
-            in_params  = InputVStreamParams.make(self._network,
-                                                 format_type=FormatType.UINT8)
-            out_params = OutputVStreamParams.make(self._network,
-                                                  format_type=FormatType.FLOAT32)
-            with InferVStreams(self._network, in_params, out_params) as pipeline:
-                raw_out = pipeline.infer(input_data)
-        except Exception as e:
-            logger.warning(f"HailoYOLORunner inference error: {e}")
+            raw_out = self._result_q.get(timeout=2.0)
+        except queue.Empty:
+            return []
+
+        if raw_out is None:
             return []
 
         return self._parse_hailo_output(raw_out, orig_w, orig_h)
 
     def _parse_hailo_output(self, raw_out: dict,
                             orig_w: int, orig_h: int) -> list:
+        """
+        Parse Hailo YOLOv8 NMS output.
+
+        Output is per-class: tensor shape (1, 80) where each element
+        is an ndarray of shape (K, 5): [ymin, xmin, ymax, xmax, score].
+        Coordinates normalised to [0, 1].
+        """
         dets = []
-
         try:
-            combined = None
-            for v in raw_out.values():
-                arr = np.array(v).squeeze()
-                if arr.ndim == 2 and arr.shape[-1] >= 85:
-                    combined = arr
-                    break
+            tensor = next(iter(raw_out.values()))
 
-            if combined is not None:
-                for row in combined:
-                    obj_conf = float(row[4])
-                    if obj_conf < self.conf_threshold:
-                        continue
-                    cls_idx  = int(np.argmax(row[5:85]))
-                    cls_conf = float(row[5 + cls_idx]) * obj_conf
-                    if cls_conf < self.conf_threshold:
-                        continue
-
-                    cx, cy, bw, bh = row[0], row[1], row[2], row[3]
-                    x1 = int((cx - bw / 2) * orig_w)
-                    y1 = int((cy - bh / 2) * orig_h)
-                    x2 = int((cx + bw / 2) * orig_w)
-                    y2 = int((cy + bh / 2) * orig_h)
-                    x1, y1 = max(0, x1), max(0, y1)
-                    x2, y2 = min(orig_w, x2), min(orig_h, y2)
-
-                    name     = COCO_CLASSES[cls_idx] if cls_idx < len(COCO_CLASSES) else str(cls_idx)
-                    zone_idx = min(int(((x1 + x2) / 2) / orig_w * 5), 4)
-
-                    dets.append({
-                        "name":          name,
-                        "conf":          cls_conf,
-                        "bbox":          (x1, y1, x2, y2),
-                        "zone_idx":      zone_idx,
-                        "high_priority": name in HIGH_PRIORITY,
-                    })
+            # Unwrap batch dimension
+            if isinstance(tensor, (list, tuple)):
+                per_class = tensor[0]
+            elif hasattr(tensor, '__getitem__'):
+                try:
+                    per_class = tensor[0]
+                except (IndexError, TypeError):
+                    per_class = tensor
             else:
-                boxes_tensor  = None
-                scores_tensor = None
-                for k, v in raw_out.items():
-                    arr = np.array(v).squeeze()
-                    if "box" in k.lower() and arr.ndim == 2 and arr.shape[-1] == 4:
-                        boxes_tensor = arr
-                    elif "score" in k.lower() or "class" in k.lower():
-                        scores_tensor = arr
+                per_class = tensor
 
-                if boxes_tensor is not None and scores_tensor is not None:
-                    for i, box in enumerate(boxes_tensor):
-                        scores   = scores_tensor[i] if i < len(scores_tensor) else []
-                        if len(scores) == 0:
+            # Check if this is per-class NMS format (80 items)
+            try:
+                n_classes = len(per_class)
+            except TypeError:
+                return dets
+
+            if n_classes == len(COCO_CLASSES):
+                # Per-class NMS output
+                for cls_idx, class_dets in enumerate(per_class):
+                    class_dets = np.array(class_dets, dtype=np.float32)
+                    if class_dets.ndim != 2 or class_dets.shape[0] == 0:
+                        continue
+
+                    for det_row in class_dets:
+                        if len(det_row) < 5:
                             continue
-                        cls_idx  = int(np.argmax(scores))
-                        cls_conf = float(scores[cls_idx])
-                        if cls_conf < self.conf_threshold:
+                        score = float(det_row[4])
+                        if score < self.conf_threshold:
                             continue
 
-                        if box[0] < box[2] and box[1] < box[3]:
-                            x1 = int(box[0] * orig_w); y1 = int(box[1] * orig_h)
-                            x2 = int(box[2] * orig_w); y2 = int(box[3] * orig_h)
-                        else:
-                            y1 = int(box[0] * orig_h); x1 = int(box[1] * orig_w)
-                            y2 = int(box[2] * orig_h); x2 = int(box[3] * orig_w)
+                        ymin, xmin, ymax, xmax = det_row[0], det_row[1], det_row[2], det_row[3]
+                        x1 = max(0, int(xmin * orig_w))
+                        y1 = max(0, int(ymin * orig_h))
+                        x2 = min(orig_w, int(xmax * orig_w))
+                        y2 = min(orig_h, int(ymax * orig_h))
 
-                        name     = COCO_CLASSES[cls_idx] if cls_idx < len(COCO_CLASSES) else str(cls_idx)
+                        if x2 <= x1 or y2 <= y1:
+                            continue
+
+                        name = COCO_CLASSES[cls_idx] if cls_idx < len(COCO_CLASSES) else str(cls_idx)
                         zone_idx = min(int(((x1 + x2) / 2) / orig_w * 5), 4)
 
+                        dets.append({
+                            "name":          name,
+                            "conf":          score,
+                            "bbox":          (x1, y1, x2, y2),
+                            "zone_idx":      zone_idx,
+                            "high_priority": name in HIGH_PRIORITY,
+                        })
+            else:
+                # Fallback: combined tensor format
+                try:
+                    arr = np.array(tensor, dtype=np.float32).squeeze()
+                except (ValueError, TypeError):
+                    return dets
+                if arr.ndim == 2 and arr.shape[-1] >= 85:
+                    for row in arr:
+                        obj_conf = float(row[4])
+                        if obj_conf < self.conf_threshold:
+                            continue
+                        cls_idx  = int(np.argmax(row[5:85]))
+                        cls_conf = float(row[5 + cls_idx]) * obj_conf
+                        if cls_conf < self.conf_threshold:
+                            continue
+                        cx, cy, bw, bh = row[0], row[1], row[2], row[3]
+                        x1 = max(0, int((cx - bw / 2) * orig_w))
+                        y1 = max(0, int((cy - bh / 2) * orig_h))
+                        x2 = min(orig_w, int((cx + bw / 2) * orig_w))
+                        y2 = min(orig_h, int((cy + bh / 2) * orig_h))
+                        name = COCO_CLASSES[cls_idx] if cls_idx < len(COCO_CLASSES) else str(cls_idx)
+                        zone_idx = min(int(((x1 + x2) / 2) / orig_w * 5), 4)
                         dets.append({
                             "name":          name,
                             "conf":          cls_conf,
@@ -433,7 +505,6 @@ class HailoYOLORunner:
         return dets
 
     # ── CPU fallback (ultralytics) ───────────────────────────────────────────
-    # Only reached when the HEF file does NOT exist (developer workstation).
 
     def _load_cpu_fallback(self) -> bool:
         try:
@@ -445,7 +516,7 @@ class HailoYOLORunner:
             return True
         except Exception as e:
             logger.error(f"HailoYOLORunner: CPU fallback failed: {e}")
-            self._ready = True   # return empty detections gracefully
+            self._ready = True
             return False
 
     def _detect_ultralytics(self, bgr_frame: np.ndarray) -> list:

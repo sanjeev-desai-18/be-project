@@ -129,6 +129,18 @@ _NOISE_BASELINE: float = _measure_noise_level()
 # ═══════════════════════════════════════════════════════════════════════════════
 # PUBLIC: listen() — record until silence, transcribe via Groq Whisper
 # ═══════════════════════════════════════════════════════════════════════════════
+def _set_nav_speech_pause(paused: bool):
+    """Helper to pause/resume navigation speech while mic is recording."""
+    try:
+        from modules.navigation.navigation_module import nav_speech_paused
+        if paused:
+            nav_speech_paused.set()
+        else:
+            nav_speech_paused.clear()
+    except ImportError:
+        pass
+
+
 def listen() -> str:
     """
     Record from USB microphone until silence is detected.
@@ -171,6 +183,9 @@ def listen() -> str:
                 is_speech = volume > speech_threshold
 
                 if is_speech:
+                    if not started_speaking:
+                        # Pause nav speech as soon as user starts talking
+                        _set_nav_speech_pause(True)
                     started_speaking = True
                     silence_chunks   = 0
                     audio_chunks.append(chunk)
@@ -186,10 +201,13 @@ def listen() -> str:
 
     except Exception as e:
         logger.error(f"Microphone stream error: {e}")
+        _set_nav_speech_pause(False)
         return ""
 
     if not audio_chunks:
         logger.debug("No speech detected in this window")
+        # No speech detected — no need to keep nav paused
+        _set_nav_speech_pause(False)
         return ""
 
     full_audio = np.concatenate(audio_chunks)
@@ -198,9 +216,13 @@ def listen() -> str:
     # brief noise bursts that pass the volume threshold usually are.
     if len(full_audio) < SAMPLE_RATE * 1.5:
         logger.warning("Recording too short — skipping (likely noise)")
+        _set_nav_speech_pause(False)
         return ""
 
     transcript = _transcribe_numpy(full_audio, SAMPLE_RATE)
+
+    # Resume nav speech after transcription is done
+    _set_nav_speech_pause(False)
 
     # Discard very short / nonsensical transcriptions (noise artefacts)
     if transcript and len(transcript.split()) < 2:

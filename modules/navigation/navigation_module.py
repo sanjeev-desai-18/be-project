@@ -40,15 +40,24 @@ _yolo_runner  = None
 
 # ── HEF paths — stored in modules/navigation/models/ ────────────────────────
 # Resolve relative to THIS file so no dependency on config.BASE_DIR
-_NAV_DIR        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-_MIDAS_HEF_PATH = os.path.join(_NAV_DIR, "Midas_v2_small_model.hef")
-_YOLO_HEF_PATH  = os.path.join(_NAV_DIR, "yolov8m.hef")
+_NAV_DIR           = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+_SCDEPTH_HEF_PATH  = os.path.join(_NAV_DIR, "scdepthv3.hef")
+_MIDAS_HEF_PATH    = os.path.join(_NAV_DIR, "Midas_v2_small_model.hef")
+_YOLO_HEF_PATH     = os.path.join(_NAV_DIR, "yolov8m.hef")
+
+# Prefer SCDepthV3 if available, fall back to MiDaS
+_DEPTH_HEF_PATH = _SCDEPTH_HEF_PATH if os.path.exists(_SCDEPTH_HEF_PATH) else _MIDAS_HEF_PATH
 
 # ── Module state ─────────────────────────────────────────────────────────────
 navigation_active: bool          = False
 _nav_thread: threading.Thread | None = None
 _stop_event: threading.Event     = threading.Event()
 _camera_released: threading.Event = threading.Event()
+
+# ── Speech pause flag — set by mic_loop while user is speaking ───────────────
+# This lets the voice listener temporarily silence nav speech so the user's
+# voice command is not drowned out by navigation announcements.
+nav_speech_paused: threading.Event = threading.Event()   # SET = paused
 
 # ── Shared frame (vision thread writes, display loop reads) ──────────────────
 _latest_frame_lock = threading.Lock()
@@ -91,7 +100,7 @@ ZONE_COL = {
 }
 
 # Speech cooldowns (seconds) — prevent audio spam
-_SPEECH_CD = {"danger": 4.0, "warn": 6.0, "notice": 10.0, "clear": 12.0}
+_SPEECH_CD = {"danger": 5.0, "warn": 8.0, "notice": 12.0, "clear": 15.0}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -142,6 +151,8 @@ class NavSpeechScheduler:
     """
     Decides WHAT to say and WHEN — delegates to the project's TTS Speaker.
     All calls are non-blocking (Speaker uses its own thread internally).
+    Respects nav_speech_paused flag so mic can capture voice commands.
+    Caches last message to avoid repeating identical guidance.
     """
 
     def __init__(self):
@@ -149,44 +160,75 @@ class NavSpeechScheduler:
         self._prev_lvl:   dict = {}
         self._last_obj:   dict = {}
         self._last_guide: float = 0.0
+        self._last_msg:   str  = ""   # cache to skip duplicate messages
+
+    def _speak_cached(self, speaker, msg: str):
+        """Only speak if the message differs from the last one spoken."""
+        if msg != self._last_msg:
+            speaker.speak(msg)
+            self._last_msg = msg
 
     def update(self, zones: list, detections: list, safe_dir: str,
                speaker) -> None:
         now = time.time()
 
-        # ── 1. Immediate danger ──────────────────────────────────────────────
+        # ── Respect speech-pause flag (mic listening) ────────────────────────
+        paused = nav_speech_paused.is_set()
+
+        # ── 1. Danger — only when center + at least one adjacent are blocked ─
         danger_zones = [z for z in zones if z["level"] == "danger"]
         if danger_zones:
-            dz = min(danger_zones, key=lambda x: x["distance_m"])
-            if now - self._last.get("danger_alert", 0) >= _SPEECH_CD["danger"]:
-                escape = self._escape_direction(zones, dz["name"])
-                if escape:
-                    msg = (f"Stop! Obstacle {dz['distance_m']} metres "
-                           f"{dz['name']}. Step {escape}.")
-                else:
-                    msg = f"Stop! Very close obstacle {dz['name']}. Do not move."
-                speaker.speak(msg)
-                self._last["danger_alert"] = now
-                return
+            zm = {z["name"]: z for z in zones}
+            center_bad = zm.get("center", {}).get("level") in ("danger", "warn")
+            left_bad   = zm.get("left", {}).get("level") in ("danger", "warn")
+            right_bad  = zm.get("right", {}).get("level") in ("danger", "warn")
+            # Only say "stop" when center AND at least one adjacent are blocked
+            if center_bad and (left_bad or right_bad):
+                dz = min(danger_zones, key=lambda x: x["distance_m"])
+                if now - self._last.get("danger_alert", 0) >= _SPEECH_CD["danger"]:
+                    escape = self._escape_direction(zones, dz["name"])
+                    if escape:
+                        msg = f"Stop! Move {escape}."
+                    else:
+                        msg = "Stop! Do not move forward."
+                    self._speak_cached(speaker, msg)
+                    self._last["danger_alert"] = now
+                    return
 
-        # ── 2. High-priority YOLO objects ────────────────────────────────────
+        # If paused for mic listening, skip non-critical speech
+        if paused:
+            for z in zones:
+                self._prev_lvl[z["name"]] = z["level"]
+            return
+
+        # ── 2. YOLO object announcements ─────────────────────────────────────
         from modules.navigation.hailo_runner import HIGH_PRIORITY
         for det in detections:
             if det["high_priority"]:
                 name = det["name"]
-                if now - self._last_obj.get(name, 0) >= 4.0:
+                if now - self._last_obj.get(name, 0) >= 6.0:
                     zone_name = ZONES[det["zone_idx"]][0]
+                    zone_info = next((z for z in zones if z["name"] == zone_name), None)
+                    dist_m = zone_info["distance_m"] if zone_info else 3.0
+                    steps = self._steps(dist_m)
                     avoid = self._escape_direction(zones, zone_name)
-                    msg = (f"{name} on your {zone_name}. Move {avoid}."
-                           if avoid else f"{name} ahead. Slow down.")
-                    speaker.speak(msg)
+                    if zone_name == "center":
+                        pos = "ahead"
+                    elif zone_name in ("left", "far left"):
+                        pos = "to your left"
+                    else:
+                        pos = "to your right"
+                    msg = f"{name} {steps} step{'s' if steps != 1 else ''} {pos}."
+                    if avoid:
+                        msg += f" Move {avoid}."
+                    self._speak_cached(speaker, msg)
                     self._last_obj[name] = now
                     return
 
-        # ── 3. Navigation guidance every 5 s ────────────────────────────────
-        if now - self._last_guide >= 5.0:
-            guide = self._navigation_instruction(zones, safe_dir)
-            speaker.speak(guide)
+        # ── 3. Navigation guidance every 6 s ─────────────────────────────────
+        if now - self._last_guide >= 6.0:
+            guide = self._navigation_instruction(zones, detections, safe_dir)
+            self._speak_cached(speaker, guide)
             self._last_guide = now
             return
 
@@ -195,8 +237,8 @@ class NavSpeechScheduler:
             prev = self._prev_lvl.get(z["name"], "clear")
             if prev in ("danger", "warn") and z["level"] == "clear":
                 key = z["name"] + "_clear"
-                if now - self._last.get(key, 0) >= 5.0:
-                    speaker.speak(f"{z['name']} is now clear.")
+                if now - self._last.get(key, 0) >= 8.0:
+                    self._speak_cached(speaker, f"{z['name']} is now clear.")
                     self._last[key] = now
 
         for z in zones:
@@ -204,7 +246,7 @@ class NavSpeechScheduler:
 
     # ── helpers ─────────────────────────────────────────────────────────────
 
-    def _navigation_instruction(self, zones: list, safe_dir: str) -> str:
+    def _navigation_instruction(self, zones: list, detections: list, safe_dir: str) -> str:
         zm         = {z["name"]: z for z in zones}
         center     = zm.get("center", {})
         left       = zm.get("left",   {})
@@ -212,45 +254,58 @@ class NavSpeechScheduler:
         far_left   = zm.get("far left",  {})
         far_right  = zm.get("far right", {})
 
-        if all(z["level"] == "clear" for z in zones):
-            return f"All clear. Walk straight, {self._steps(center.get('distance_m', 5))} steps ahead."
+        # YOLO object suffix (max 1 object to keep speech short)
+        obj_suffix = ""
+        for det in detections:
+            if det.get("high_priority"):
+                zn = ZONES[det["zone_idx"]][0]
+                zi = next((z for z in zones if z["name"] == zn), None)
+                d  = zi["distance_m"] if zi else 3.0
+                s  = self._steps(d)
+                pos = "ahead" if zn == "center" else ("to your left" if zn in ("left", "far left") else "to your right")
+                obj_suffix = f". {det['name']} {s} step{'s' if s != 1 else ''} {pos}"
+                break
 
+        # All clear
+        if all(z["level"] == "clear" for z in zones):
+            return f"Forward path is clear{obj_suffix}"
+
+        # Center clear and best
         if center.get("level") == "clear" and \
            center.get("distance_m", 0) >= left.get("distance_m", 0) and \
            center.get("distance_m", 0) >= right.get("distance_m", 0):
-            return f"Walk straight. {self._steps(center.get('distance_m', 5))} steps ahead."
+            return f"Walk straight{obj_suffix}"
 
+        # Center blocked
         if center.get("level") in ("danger", "warn"):
             if left.get("distance_m", 0) > right.get("distance_m", 0) and \
                left.get("level") in ("clear", "notice"):
-                return (f"Obstacle ahead. Turn left. "
-                        f"{self._steps(left.get('distance_m', 3))} steps clear on left.")
+                return f"Move one step left{obj_suffix}"
             elif right.get("distance_m", 0) > left.get("distance_m", 0) and \
                  right.get("level") in ("clear", "notice"):
-                return (f"Obstacle ahead. Turn right. "
-                        f"{self._steps(right.get('distance_m', 3))} steps clear on right.")
+                return f"Move one step right{obj_suffix}"
             elif far_left.get("level") == "clear":
-                return "Move to your far left. Path is clear there."
+                return f"Move to your far left{obj_suffix}"
             elif far_right.get("level") == "clear":
-                return "Move to your far right. Path is clear there."
+                return f"Move to your far right{obj_suffix}"
             else:
-                return "Path blocked ahead. Stop and wait."
+                return f"Path blocked. Stop{obj_suffix}"
 
+        # Sides imbalanced
         ld, rd = left.get("distance_m", 0), right.get("distance_m", 0)
-        if ld > rd + 1.0:
-            return f"Slight left. {self._steps(ld)} steps of space on left."
-        elif rd > ld + 1.0:
-            return f"Slight right. {self._steps(rd)} steps of space on right."
+        if ld > rd + 0.8:
+            return f"Move slightly left{obj_suffix}"
+        elif rd > ld + 0.8:
+            return f"Move slightly right{obj_suffix}"
 
-        sd   = zm.get(safe_dir, {})
-        dist = sd.get("distance_m", 5)
+        # Fallback
         if safe_dir == "center":
-            return f"Walk straight. {self._steps(dist)} steps ahead."
-        return f"Head {safe_dir}. {self._steps(dist)} steps clear."
+            return f"Walk straight{obj_suffix}"
+        return f"Move slightly {safe_dir}{obj_suffix}"
 
     @staticmethod
     def _steps(metres: float) -> int:
-        return max(1, round(metres / 0.75))
+        return max(1, round(metres / 1.5))
 
     @staticmethod
     def _escape_direction(zones: list, blocked: str) -> str:
@@ -388,7 +443,7 @@ def _vision_loop(speaker):
     global _depth_runner, _yolo_runner
     if _depth_runner is None:
         from modules.navigation.hailo_runner import HailoDepthRunner
-        _depth_runner = HailoDepthRunner(_MIDAS_HEF_PATH)
+        _depth_runner = HailoDepthRunner(_DEPTH_HEF_PATH)
         _depth_runner.load()
 
     if _yolo_runner is None:
@@ -411,6 +466,12 @@ def _vision_loop(speaker):
         _camera_released.set()
         return
 
+    # Cached results for frame-skipping (depth every 2nd, yolo every 3rd)
+    cached_depth_map  = None
+    cached_zones      = []
+    cached_safe_dir   = "center"
+    cached_detections = []
+
     try:
         while not _stop_event.is_set():
             # ── Capture frame ───────────────────────────────────────────────
@@ -418,25 +479,38 @@ def _vision_loop(speaker):
                 bgr = cam.capture_array()
             except Exception as e:
                 logger.warning(f"Navigation: capture error: {e}")
-                time.sleep(0.05)
+                time.sleep(0.02)
                 continue
 
             if bgr is None:
-                time.sleep(0.05)
+                time.sleep(0.02)
                 continue
 
-            # camera_manager returns BGR (RGB888 in libcamera → OpenCV native)
             frame = bgr
+            frame_count += 1
 
-            # ── Depth estimation ────────────────────────────────────────────
-            depth_map = _depth_runner.estimate(frame)
+            # ── Depth estimation (every 2nd frame) ──────────────────────────
+            if frame_count % 2 == 0 or cached_depth_map is None:
+                depth_map = _depth_runner.estimate(frame)
+                if depth_map is not None:
+                    cached_depth_map = depth_map
+                    cached_zones     = analyser.analyse(depth_map, _depth_runner)
+                    cached_safe_dir  = analyser.safe_direction(cached_zones)
 
-            # ── Zone analysis ───────────────────────────────────────────────
-            zones    = analyser.analyse(depth_map, _depth_runner)
-            safe_dir = analyser.safe_direction(zones)
+            # ── Object detection (every 3rd frame) ──────────────────────────
+            if frame_count % 3 == 0 or not cached_detections:
+                dets = _yolo_runner.detect(frame)
+                if dets is not None:
+                    cached_detections = dets
 
-            # ── Object detection ────────────────────────────────────────────
-            detections = _yolo_runner.detect(frame)
+            # Use cached results for this frame
+            depth_map  = cached_depth_map
+            zones      = cached_zones
+            safe_dir   = cached_safe_dir
+            detections = cached_detections
+
+            if depth_map is None:
+                continue
 
             # ── Speech scheduler ────────────────────────────────────────────
             try:
@@ -445,7 +519,6 @@ def _vision_loop(speaker):
                 logger.warning(f"Navigation speech scheduler error: {e}")
 
             # ── Build display frame ─────────────────────────────────────────
-            frame_count += 1
             fps = frame_count / max(time.time() - start_time, 0.001)
             try:
                 display = vis.build(frame, depth_map, zones,
