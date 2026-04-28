@@ -17,7 +17,7 @@ Changes from previous version
 Performance notes (unchanged from previous version)
 -----------------------------------------------------
   - Direct capture_array() call instead of per-frame thread spawn.
-  - CONFIRM_WINDOW=8, CONFIRM_HITS=6 → confirms in ~0.5 s at 15 fps.
+  - CONFIRM_WINDOW=4, CONFIRM_HITS=3 → confirms in ~0.25 s at 15 fps.
   - ANNOUNCE_REPEAT / announce_count logic removed; currency_logic fires
     on new confirmed track IDs.
 """
@@ -45,11 +45,15 @@ CLASS_NAMES_FALLBACK = [
 
 CONFIDENCE_THRESHOLD = 0.75
 
-CONFIRM_WINDOW = 8
-CONFIRM_HITS   = 6
+# Faster confirmation: 4 frames window, 3 hits required → confirms in ~0.25s at 15fps
+CONFIRM_WINDOW = 4
+CONFIRM_HITS   = 3
 MAJORITY_RATIO = 0.75
 
-DISAPPEAR_FRAMES  = 10
+# Low disappear frames: tracker drops a note after 3 missed frames (~200ms at 15fps)
+# currency_logic.py has its own GONE_FRAMES debounce on top of this so we
+# do NOT need a large value here — keeping it small means the tracker stays clean.
+DISAPPEAR_FRAMES  = 3
 TRACK_IOU_THRESH  = 0.35
 NMS_IOU_THRESHOLD = 0.50
 

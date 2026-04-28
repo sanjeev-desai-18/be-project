@@ -437,6 +437,7 @@ class _TTSWorker:
     def __init__(self):
         self._announcement_q = queue.Queue(maxsize=1)
         self._stream_q       = queue.Queue()          # unbounded — never drops
+        self._interrupt_flag = threading.Event()      # set to abort current playback
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="tts-worker"
         )
@@ -461,6 +462,41 @@ class _TTSWorker:
                 self._announcement_q.put_nowait(text)
             except queue.Full:
                 pass
+
+    def interrupt_announcement(self, text: str):
+        """
+        Stop any currently-playing audio immediately, clear the queue,
+        and enqueue the new message at the front.
+        Use for: real-time currency changes where stale audio must not play.
+        """
+        # Signal worker to abort current playback
+        self._interrupt_flag.set()
+        # Drain stale pending announcements
+        while True:
+            try:
+                self._announcement_q.get_nowait()
+            except queue.Empty:
+                break
+        # Stop piper / sounddevice playback in-flight
+        try:
+            import sounddevice as sd
+            sd.stop()
+        except Exception:
+            pass
+        # Stop pygame playback in-flight
+        try:
+            import pygame
+            if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
+                pygame.mixer.music.stop()
+        except Exception:
+            pass
+        # Enqueue new message
+        try:
+            self._announcement_q.put_nowait(text)
+        except queue.Full:
+            pass
+        # Clear interrupt flag — worker will pick up after stopping
+        self._interrupt_flag.clear()
 
     # ── stream path (ordered, no drop) ───────────────────────────────────────
 
@@ -652,6 +688,17 @@ class Speaker:
         preview = text[:70] + "..." if len(text) > 70 else text
         logger.info(f"Queuing announcement: '{preview}'")
         _get_worker().enqueue_announcement(text)
+
+    def interrupt_and_speak(self, text: str):
+        """
+        Stop whatever is currently playing and speak this text immediately.
+        Use for real-time currency updates — ensures stale audio never plays.
+        """
+        if not text or not text.strip():
+            return
+        preview = text[:70] + "..." if len(text) > 70 else text
+        logger.info(f"Interrupt-speak: '{preview}'")
+        _get_worker().interrupt_announcement(text)
 
     def speak_stream(self, text: str):
         """Ordered stream sentence — never dropped."""

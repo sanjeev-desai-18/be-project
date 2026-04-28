@@ -1,8 +1,12 @@
 """
 modules/currency/currency_logic.py
+
+Speaks the detected currency every time a confirmed note is present.
+No cooldown, no scene-change tracking — just speak on every confirmed frame.
+The TTS worker's drop-oldest queue ensures the speaker is never flooded:
+if it's still speaking, the new message replaces the pending one.
 """
 
-import time
 import threading
 from collections import Counter
 from utils.logger import logger
@@ -28,59 +32,29 @@ def _speak(text: str):
     spk = _get_speaker()
     if spk:
         spk.speak(text)
-        logger.info(f"currency_logic: queued -> '{text}'")
+        logger.info(f"currency_logic: speak -> '{text}'")
     else:
         logger.warning(f"currency_logic: [NO TTS] {text}")
 
 
-_lock             = threading.Lock()
-_announced_ids    = set()
-_last_speak_time  = 0.0
-
-SPEAK_COOLDOWN = 2.5
-
-
 def reset_logic_state():
-    global _announced_ids, _last_speak_time
-    with _lock:
-        _announced_ids   = set()
-        _last_speak_time = 0.0
     logger.info("currency_logic: state reset")
 
 
 def process_confirmed_notes(confirmed: list) -> None:
-    global _announced_ids, _last_speak_time
-
+    """
+    Called every frame. Speaks immediately whenever confirmed notes are visible.
+    The TTS drop-oldest queue handles rate limiting — if the speaker is busy,
+    the stale pending message is replaced with the latest one.
+    """
     if not confirmed:
-        with _lock:
-            _announced_ids = set()
         return
 
-    visible_ids = {t["track_id"] for t in confirmed}
-
-    with _lock:
-        _announced_ids &= visible_ids
-        new_ids = visible_ids - _announced_ids
-
-    if not new_ids:
-        return
-
-    now = time.time()
-    with _lock:
-        since_last = now - _last_speak_time
-
-    if since_last < SPEAK_COOLDOWN:
-        logger.debug(f"currency_logic: cooldown {since_last:.1f}s / {SPEAK_COOLDOWN}s")
-        return
-
-    msg = _build_message(confirmed)
-
-    with _lock:
-        _announced_ids  = _announced_ids | visible_ids
-        _last_speak_time = now
-
+    msg = _build_message([t["confirmed_cls"] for t in confirmed])
     _speak(msg)
 
+
+# ── Message builder ───────────────────────────────────────────────────────────
 
 _SPOKEN = {
     "10_rupees":   "10 rupee",
@@ -97,8 +71,8 @@ def _label(cls: str) -> str:
     return _SPOKEN.get(cls, cls.replace("_", " "))
 
 
-def _build_message(tracks: list) -> str:
-    counts = Counter(_label(t["confirmed_cls"]) for t in tracks)
+def _build_message(classes: list) -> str:
+    counts = Counter(_label(c) for c in classes)
     items  = sorted(counts.items(), key=lambda x: x[0])
 
     phrases = []
